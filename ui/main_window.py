@@ -2,16 +2,16 @@
 capa 1 - ventana principal de la aplicacion rzi.
 
 layout:
-  [parametros] | [visor original] [visor reconstruido] | [resultados]
+    [parametros] | [visor original] [visor reconstruido] | [resultados]
 
 flujo de "reconstruir" (upscaling armonico + embed):
-  1. el usuario hace zoom sobre una region de interes en el visor izquierdo
-  2. al pulsar "reconstruir", la region visible se agranda factor veces con laplace sor
-  3. el resultado se reduce de vuelta al tamano original (LANCZOS) y se embebe
-  4. el visor derecho muestra la imagen COMPLETA con la region refinada, al mismo zoom
+    1. el usuario hace zoom sobre una region de interes en el visor izquierdo
+    2. al pulsar "reconstruir", la region visible se agranda factor veces con laplace sor
+    3. el resultado se reduce de vuelta al tamano original (LANCZOS) y se embebe
+    4. el visor derecho muestra la imagen COMPLETA con la region refinada, al mismo zoom
 
 flujo de "comparar 3 modelos" (enfoque b, para metricas psnr/ssim):
-  se degrada la imagen a proposito y se mide la calidad de la reconstruccion
+    se degrada la imagen a proposito y se mide la calidad de la reconstruccion
 """
 
 import os
@@ -157,11 +157,6 @@ QHeaderView::section {
 QCheckBox { color: #E0E0E0; spacing: 6px; }
 """
 
-
-# ===========================================================================
-# hilo de calculo - evita congelar la gui durante el solver
-# ===========================================================================
-
 class HiloCalculo(QThread):
     terminado = Signal(object)
     error     = Signal(str)
@@ -179,10 +174,6 @@ class HiloCalculo(QThread):
         except Exception as exc:
             self.error.emit(str(exc))
 
-
-# ===========================================================================
-# panel izquierdo - parametros del solver
-# ===========================================================================
 
 class PanelParametros(QWidget):
     reconstruir_solicitado   = Signal()
@@ -208,7 +199,7 @@ class PanelParametros(QWidget):
         tit.setStyleSheet('color: #2196F3; padding: 4px;')
         lay.addWidget(tit)
 
-        # --- submuestreo ---
+        
         g_entrada = QGroupBox('Submuestreo')
         gl = QGridLayout(g_entrada)
         gl.setSpacing(6)
@@ -223,7 +214,7 @@ class PanelParametros(QWidget):
 
         lay.addWidget(g_entrada)
 
-        # --- solver ---
+        
         g_solver = QGroupBox('Solver SOR Red-Black')
         sl = QGridLayout(g_solver)
         sl.setSpacing(6)
@@ -261,7 +252,7 @@ class PanelParametros(QWidget):
 
         lay.addWidget(g_solver)
 
-        # --- realce de nitidez ---
+        
         g_sharp = QGroupBox('Nitidez (USM)')
         nl = QGridLayout(g_sharp)
         nl.setSpacing(6)
@@ -274,7 +265,7 @@ class PanelParametros(QWidget):
         nl.addWidget(self.spin_usm, 0, 1)
         lay.addWidget(g_sharp)
 
-        # --- botones ---
+        
         self.btn_reconstruir = QPushButton('Reconstruir (Poisson SOR)')
         self.btn_reconstruir.setObjectName('btn_principal')
         self.btn_reconstruir.setMinimumHeight(36)
@@ -334,11 +325,6 @@ class PanelParametros(QWidget):
                     self.btn_lupa, self.btn_animar):
             btn.setEnabled(not flag)
 
-
-# ===========================================================================
-# panel derecho - resultados con tabs
-# ===========================================================================
-
 class PanelResultados(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -395,9 +381,7 @@ class PanelResultados(QWidget):
             lay_exp.addWidget(btn)
         lay.addLayout(lay_exp)
 
-    # ------------------------------------------------------------------
     # actualizar cada tab
-    # ------------------------------------------------------------------
 
     def mostrar_comparacion(self, original, bicubica, laplace, poisson, tabla):
         fig = grafica_comparacion_4modelos(original, bicubica, laplace, poisson, tabla)
@@ -502,11 +486,6 @@ class PanelResultados(QWidget):
 
         canvas.draw()
 
-
-# ===========================================================================
-# ventana principal
-# ===========================================================================
-
 class VentanaPrincipal(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -540,14 +519,14 @@ class VentanaPrincipal(QMainWindow):
         lay = QHBoxLayout(central)
         lay.setContentsMargins(0, 0, 0, 0)
 
-        # ----- panel izquierdo: parametros -----
+        
         scroll_p = QScrollArea()
         scroll_p.setWidgetResizable(True)
         scroll_p.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.panel_params = PanelParametros()
         scroll_p.setWidget(self.panel_params)
 
-        # ----- centro: dos visores lado a lado -----
+        
         cen_w = QWidget()
         cen_l = QVBoxLayout(cen_w)
         cen_l.setContentsMargins(6, 6, 6, 6)
@@ -584,7 +563,7 @@ class VentanaPrincipal(QMainWindow):
         self.barra_progreso.setVisible(False)
         cen_l.addWidget(self.barra_progreso)
 
-        # ----- panel derecho: resultados -----
+        
         self.panel_res = PanelResultados()
 
         splitter = QSplitter(Qt.Horizontal)
@@ -641,9 +620,7 @@ class VentanaPrincipal(QMainWindow):
         self.panel_res.btn_guardar_graf.clicked.connect(self._guardar_grafica)
         self.panel_res.btn_exportar_csv.clicked.connect(self._exportar_csv)
 
-    # ------------------------------------------------------------------
     # cargar imagen
-    # ------------------------------------------------------------------
 
     def _abrir_imagen(self):
         ruta, _ = QFileDialog.getOpenFileName(
@@ -668,9 +645,7 @@ class VentanaPrincipal(QMainWindow):
         self.visor_orig.ajustar_a_ventana()
         self.visor_recon.ajustar_a_ventana()
 
-    # ------------------------------------------------------------------
     # extraccion del tile visible en el visor izquierdo
-    # ------------------------------------------------------------------
 
     def _tile_desde_viewport(self) -> tuple | None:
         """
@@ -700,9 +675,7 @@ class VentanaPrincipal(QMainWindow):
 
         return tile, x, y, w, h
 
-    # ------------------------------------------------------------------
     # gestion del hilo de calculo
-    # ------------------------------------------------------------------
 
     def _iniciar_hilo(self, funcion, *args, **kwargs) -> bool:
         if self._hilo and self._hilo.isRunning():
@@ -723,9 +696,7 @@ class VentanaPrincipal(QMainWindow):
         self.barra_progreso.setVisible(False)
         self.panel_params.deshabilitar(False)
 
-    # ------------------------------------------------------------------
     # modo lupa matematica
-    # ------------------------------------------------------------------
     def _toggle_modo_lupa(self, activado: bool):
         if activado:
             if self._imagen_orig is None:
@@ -783,9 +754,7 @@ class VentanaPrincipal(QMainWindow):
         self.visor_recon.establecer_imagen(imagen_upscaled)
         self.statusBar().showMessage(f'Lupa actualizada: {imagen_upscaled.shape[1]}x{imagen_upscaled.shape[0]} px')
 
-    # ------------------------------------------------------------------
     # animacion de convergencia
-    # ------------------------------------------------------------------
     def _animar_convergencia(self):
         info = self._tile_desde_viewport()
         if info is None:
@@ -886,9 +855,7 @@ class VentanaPrincipal(QMainWindow):
         actualizar_frame(0)
         dialogo.exec()
 
-    # ------------------------------------------------------------------
     # reconstruccion poisson sor
-    # ------------------------------------------------------------------
 
     def _reconstruir(self):
         info = self._tile_desde_viewport()
@@ -989,9 +956,7 @@ class VentanaPrincipal(QMainWindow):
             f"omega={res['omega']:.4f}  "
             f"conv={'Si' if res['convergio'] else 'No (aumentar max_iter)'}")
 
-    # ------------------------------------------------------------------
     # comparacion de 3 modelos
-    # ------------------------------------------------------------------
 
     def _comparar(self):
         info = self._tile_desde_viewport()
@@ -1051,9 +1016,7 @@ class VentanaPrincipal(QMainWindow):
 
         self.statusBar().showMessage('Comparacion lista.')
 
-    # ------------------------------------------------------------------
     # barrido omega
-    # ------------------------------------------------------------------
 
     def _barrido_omega(self):
         info = self._tile_desde_viewport()
@@ -1080,9 +1043,7 @@ class VentanaPrincipal(QMainWindow):
             f"Barrido omega  |  teorico={resultado['omega_teorico']:.4f}  |  "
             f"empirico={resultado['omegas'][resultado['iteraciones'].index(min(resultado['iteraciones']))]:.4f}")
 
-    # ------------------------------------------------------------------
     # benchmark numba vs python
-    # ------------------------------------------------------------------
 
     def _benchmark(self):
         if self._imagen_orig is None:
@@ -1112,9 +1073,7 @@ class VentanaPrincipal(QMainWindow):
         self.statusBar().showMessage('Ejecutando benchmark Numba vs Python...')
         self._hilo.terminado.connect(self.panel_res.mostrar_benchmark)
 
-    # ------------------------------------------------------------------
     # exportacion
-    # ------------------------------------------------------------------
 
     def _guardar_imagen(self):
         if self._resultado is None:

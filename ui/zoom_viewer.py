@@ -43,9 +43,7 @@ class VisorImagen(QGraphicsView):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
-    # ------------------------------------------------------------------
     # mostrar imagen
-    # ------------------------------------------------------------------
 
     def establecer_imagen(self, imagen: np.ndarray) -> None:
         """recibe ndarray float64 [0,1] o uint8 y lo muestra."""
@@ -80,9 +78,7 @@ class VisorImagen(QGraphicsView):
             self.fitInView(self._pixmap_item, Qt.KeepAspectRatio)
             self._zoom = 1.0
 
-    # ------------------------------------------------------------------
     # region visible en coordenadas de imagen
-    # ------------------------------------------------------------------
 
     def obtener_viewport_imagen(self) -> tuple | None:
         """
@@ -113,9 +109,7 @@ class VisorImagen(QGraphicsView):
 
         return (x, y, w, h)
 
-    # ------------------------------------------------------------------
     # sincronizacion de zoom entre visores
-    # ------------------------------------------------------------------
 
     def copiar_estado_zoom(self, otro: 'VisorImagen') -> None:
         """
@@ -126,9 +120,7 @@ class VisorImagen(QGraphicsView):
         self.horizontalScrollBar().setValue(otro.horizontalScrollBar().value())
         self.verticalScrollBar().setValue(otro.verticalScrollBar().value())
 
-    # ------------------------------------------------------------------
     # zoom con rueda
-    # ------------------------------------------------------------------
 
     def wheelEvent(self, event: QWheelEvent) -> None:
         if not self._pixmap_item:
@@ -141,9 +133,7 @@ class VisorImagen(QGraphicsView):
             self.scale(factor, factor)
             self._zoom = nuevo
 
-    # ------------------------------------------------------------------
     # modo seleccion rectangular
-    # ------------------------------------------------------------------
 
     def activar_modo_seleccion(self, activo: bool) -> None:
         self._modo_sel = activo

@@ -18,9 +18,7 @@ except ImportError:
     SKIMAGE_DISPONIBLE = False
 
 
-# ---------------------------------------------------------------------------
 # Metricas
-# ---------------------------------------------------------------------------
 
 def psnr(original: np.ndarray, reconstruida: np.ndarray) -> float:
     """
@@ -63,9 +61,7 @@ def ssim(original: np.ndarray, reconstruida: np.ndarray) -> float:
     return float(num / den)
 
 
-# ---------------------------------------------------------------------------
 # Linea base: interpolacion bicubica (RF04)
-# ---------------------------------------------------------------------------
 
 def interpolacion_bicubica(imagen_original: np.ndarray,
                             factor: int) -> np.ndarray:
@@ -97,9 +93,7 @@ def interpolacion_bicubica(imagen_original: np.ndarray,
     return np.asarray(pil_bicubic, dtype=np.float64) / 255.0
 
 
-# ---------------------------------------------------------------------------
 # Tabla comparativa (seccion 8.2)
-# ---------------------------------------------------------------------------
 
 def tabla_comparativa(original:   np.ndarray,
                       bicubica:   np.ndarray,

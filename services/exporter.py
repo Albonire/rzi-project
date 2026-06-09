@@ -18,9 +18,7 @@ matplotlib.use('Agg')   # backend sin ventana (para guardar graficas)
 import matplotlib.pyplot as plt
 
 
-# ---------------------------------------------------------------------------
 # Guardar imagenes
-# ---------------------------------------------------------------------------
 
 def guardar_imagen(imagen: np.ndarray, ruta: str) -> None:
     """Guarda un array float64 [0,1] como imagen PNG o JPEG en disco."""
@@ -30,9 +28,7 @@ def guardar_imagen(imagen: np.ndarray, ruta: str) -> None:
     Image.fromarray(img_uint8, mode=modo).save(ruta)
 
 
-# ---------------------------------------------------------------------------
 # Exportar CSV
-# ---------------------------------------------------------------------------
 
 def exportar_csv(tabla: list, resultado_solver: dict, ruta: str) -> None:
     """
@@ -64,9 +60,7 @@ def exportar_csv(tabla: list, resultado_solver: dict, ruta: str) -> None:
             })
 
 
-# ---------------------------------------------------------------------------
 # Graficas
-# ---------------------------------------------------------------------------
 
 def grafica_convergencia(historial: np.ndarray, omega: float,
                           ruta: str = None) -> plt.Figure:
