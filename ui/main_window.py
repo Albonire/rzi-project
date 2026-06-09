@@ -39,7 +39,7 @@ from core.poisson_builder import (construir_problema, construir_problema_upscale
                                    imagen_a_grises, calcular_omega_optimo)
 from core.sor_solver import (resolver, barrido_omega as _barrido,
                               benchmark_numba_vs_python, NUMBA_DISPONIBLE,
-                              _calentamiento)
+                              _calentamiento, resolver_con_snapshots)
 from services.metrics import (psnr, ssim, interpolacion_bicubica, tabla_comparativa)
 from services.exporter import (guardar_imagen, exportar_csv,
                                 grafica_convergencia, grafica_barrido_omega,
@@ -189,6 +189,8 @@ class PanelParametros(QWidget):
     comparar_solicitado      = Signal()
     barrido_omega_solicitado = Signal()
     benchmark_solicitado     = Signal()
+    lupa_solicitado     = Signal(bool)  # True = activar, False = desactivar
+    animar_solicitado   = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -294,6 +296,19 @@ class PanelParametros(QWidget):
         self.btn_benchmark.clicked.connect(self.benchmark_solicitado)
         lay.addWidget(self.btn_benchmark)
 
+        self.btn_lupa = QPushButton('Modo Lupa (tiempo real)')
+        self.btn_lupa.setMinimumHeight(30)
+        self.btn_lupa.setCheckable(True)
+        self.btn_lupa.setToolTip('Activa lupa que sigue el cursor con upscaling SOR')
+        self.btn_lupa.toggled.connect(self.lupa_solicitado)
+        lay.addWidget(self.btn_lupa)
+
+        self.btn_animar = QPushButton('Animar Convergencia')
+        self.btn_animar.setMinimumHeight(30)
+        self.btn_animar.setToolTip('Muestra animacion frame a frame de como converge SOR')
+        self.btn_animar.clicked.connect(self.animar_solicitado)
+        lay.addWidget(self.btn_animar)
+
         # estado de numba visible para el usuario
         color = '#4CAF50' if NUMBA_DISPONIBLE else '#FF9800'
         texto = 'Numba: activo' if NUMBA_DISPONIBLE else 'Numba: no disponible (lento)'
@@ -315,7 +330,8 @@ class PanelParametros(QWidget):
 
     def deshabilitar(self, flag: bool):
         for btn in (self.btn_reconstruir, self.btn_comparar,
-                    self.btn_barrido, self.btn_benchmark):
+                    self.btn_barrido, self.btn_benchmark,
+                    self.btn_lupa, self.btn_animar):
             btn.setEnabled(not flag)
 
 
@@ -497,6 +513,9 @@ class VentanaPrincipal(QMainWindow):
         self._imagen_orig = None   # ndarray float64 [0,1] grises, imagen completa
         self._hilo        = None
         self._resultado   = None   # ultimo resultado para exportacion
+        self._modo_lupa_activo = False
+        self._hilo_lupa        = None
+        self._ultima_lupa      = 0.0
 
         self._construir_ui()
         self._construir_toolbar()
@@ -615,6 +634,9 @@ class VentanaPrincipal(QMainWindow):
         self.panel_params.barrido_omega_solicitado.connect(self._barrido_omega)
         self.panel_params.benchmark_solicitado.connect(self._benchmark)
 
+        self.panel_params.lupa_solicitado.connect(self._toggle_modo_lupa)
+        self.panel_params.animar_solicitado.connect(self._animar_convergencia)
+
         self.panel_res.btn_guardar_img.clicked.connect(self._guardar_imagen)
         self.panel_res.btn_guardar_graf.clicked.connect(self._guardar_grafica)
         self.panel_res.btn_exportar_csv.clicked.connect(self._exportar_csv)
@@ -700,6 +722,169 @@ class VentanaPrincipal(QMainWindow):
     def _en_fin_hilo(self):
         self.barra_progreso.setVisible(False)
         self.panel_params.deshabilitar(False)
+
+    # ------------------------------------------------------------------
+    # modo lupa matematica
+    # ------------------------------------------------------------------
+    def _toggle_modo_lupa(self, activado: bool):
+        if activado:
+            if self._imagen_orig is None:
+                QMessageBox.warning(self, 'Sin imagen', 'Cargue una imagen primero.')
+                self.panel_params.btn_lupa.setChecked(False)
+                return
+            self._modo_lupa_activo = True
+            self.visor_orig.setCursor(Qt.CrossCursor)
+            self.visor_orig.mouse_moved.connect(self._actualizar_lupa)
+            self.statusBar().showMessage('Modo Lupa activo: mueva el mouse sobre la imagen')
+        else:
+            self._modo_lupa_activo = False
+            self.visor_orig.unsetCursor()
+            try:
+                self.visor_orig.mouse_moved.disconnect(self._actualizar_lupa)
+            except Exception:
+                pass
+            self.statusBar().showMessage('Modo Lupa desactivado')
+
+    def _actualizar_lupa(self, x_img: int, y_img: int):
+        if not self._modo_lupa_activo or self._imagen_orig is None:
+            return
+
+        import time
+        now = time.time()
+        if (now - self._ultima_lupa) < 0.125:
+            return
+        self._ultima_lupa = now
+
+        if self._hilo_lupa is not None and self._hilo_lupa.isRunning():
+            return
+
+        radio = 60
+        x0 = max(0, x_img - radio)
+        y0 = max(0, y_img - radio)
+        x1 = min(self._imagen_orig.shape[1], x_img + radio)
+        y1 = min(self._imagen_orig.shape[0], y_img + radio)
+
+        tile = self._imagen_orig[y0:y1, x0:x1]
+        if tile.size < 64:
+            return
+
+        factor = 3
+
+        def _tarea_lupa(t=tile, f=factor):
+            problema = construir_problema_upscale(t, f)
+            res = resolver(problema, ecuacion='laplace', max_iter=400, tol=1e-4)
+            return res['imagen_recon']
+
+        self._hilo_lupa = HiloCalculo(_tarea_lupa)
+        self._hilo_lupa.terminado.connect(self._mostrar_lupa)
+        self._hilo_lupa.start()
+
+    def _mostrar_lupa(self, imagen_upscaled):
+        self.visor_recon.establecer_imagen(imagen_upscaled)
+        self.statusBar().showMessage(f'Lupa actualizada: {imagen_upscaled.shape[1]}x{imagen_upscaled.shape[0]} px')
+
+    # ------------------------------------------------------------------
+    # animacion de convergencia
+    # ------------------------------------------------------------------
+    def _animar_convergencia(self):
+        info = self._tile_desde_viewport()
+        if info is None:
+            return
+
+        tile = info[0]
+        params = self.panel_params.obtener_params()
+
+        def _tarea_animacion(t=tile, p=params):
+            problema = construir_problema_upscale(t, p['factor'])
+            return resolver_con_snapshots(
+                problema,
+                omega=p['omega'],
+                tol=p['tol'],
+                max_iter=min(p['max_iter'], 600),
+                ecuacion='laplace',
+                cada_n_iter=15
+            )
+
+        ok = self._iniciar_hilo(_tarea_animacion)
+        if not ok:
+            return
+
+        self.statusBar().showMessage('Generando animacion de convergencia...')
+        self._hilo.terminado.connect(self._mostrar_dialogo_animacion)
+
+    def _mostrar_dialogo_animacion(self, resultado: dict):
+        from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
+                                       QPushButton, QLabel, QSlider)
+        from PySide6.QtCore import QTimer, Qt
+
+        snapshots = resultado.get('snapshots', [])
+        if not snapshots:
+            QMessageBox.warning(self, 'Error', 'No se generaron snapshots.')
+            return
+
+        dialogo = QDialog(self)
+        dialogo.setWindowTitle('Animacion de Convergencia SOR Red-Black')
+        dialogo.resize(700, 650)
+        dialogo.setStyleSheet(ESTILO)
+
+        layout = QVBoxLayout(dialogo)
+
+        lbl_info = QLabel(f"Snapshots: {len(snapshots)} | "
+                          f"Iteraciones totales: {resultado['iteraciones']} | "
+                          f"Tiempo: {resultado['tiempo']:.3f}s")
+        lbl_info.setStyleSheet('color: #2196F3; font-weight: bold; padding: 4px;')
+        layout.addWidget(lbl_info)
+
+        visor_temp = VisorImagen()
+        layout.addWidget(visor_temp)
+
+        slider = QSlider(Qt.Horizontal)
+        slider.setRange(0, len(snapshots) - 1)
+        slider.setValue(0)
+        slider.setStyleSheet("""
+            QSlider::groove:horizontal {
+                background: #3A3A3A; height: 8px; border-radius: 4px;
+            }
+            QSlider::handle:horizontal {
+                background: #2196F3; width: 18px; margin: -5px 0;
+                border-radius: 9px;
+            }
+        """)
+        layout.addWidget(slider)
+
+        lbl_frame = QLabel('Frame 1 / ' + str(len(snapshots)))
+        lbl_frame.setAlignment(Qt.AlignCenter)
+        lbl_frame.setStyleSheet('color: #B0B0B0;')
+        layout.addWidget(lbl_frame)
+
+        btn_layout = QHBoxLayout()
+        btn_play  = QPushButton('▶ Reproducir')
+        btn_pause = QPushButton('⏸ Pausar')
+        btn_close = QPushButton('Cerrar')
+        for b in (btn_play, btn_pause, btn_close):
+            b.setMinimumHeight(32)
+            btn_layout.addWidget(b)
+        layout.addLayout(btn_layout)
+
+        def actualizar_frame(idx):
+            visor_temp.establecer_imagen(snapshots[idx])
+            iter_aprox = idx * resultado.get('cada_n_iter', 15)
+            lbl_frame.setText(f'Frame {idx + 1} / {len(snapshots)}  |  '
+                              f'Iteracion aproximada: {iter_aprox}')
+
+        slider.valueChanged.connect(actualizar_frame)
+
+        timer = QTimer(dialogo)
+        timer.timeout.connect(
+            lambda: slider.setValue((slider.value() + 1) % len(snapshots))
+        )
+
+        btn_play.clicked.connect(lambda: timer.start(166))
+        btn_pause.clicked.connect(timer.stop)
+        btn_close.clicked.connect(dialogo.accept)
+
+        actualizar_frame(0)
+        dialogo.exec()
 
     # ------------------------------------------------------------------
     # reconstruccion poisson sor

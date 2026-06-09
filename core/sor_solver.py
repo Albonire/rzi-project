@@ -243,3 +243,66 @@ def benchmark_numba_vs_python(problema: dict, tol: float = 1e-4,
         'forma':          problema['forma'],
         'numba_activo':   NUMBA_DISPONIBLE,
     }
+
+
+def resolver_con_snapshots(problema: dict, omega: float = None, tol: float = 1e-6,
+                           max_iter: int = 2000, ecuacion: str = 'poisson',
+                           cada_n_iter: int = 20) -> dict:
+    """
+    Resuelve la ecuacion capturando snapshots del estado de la malla
+    cada N iteraciones. Util para animaciones de convergencia.
+
+    Retorna un dict con los mismos campos que resolver() mas:
+    'snapshots': lista de ndarrays float64 [0,1] con el estado cada N iteraciones.
+    """
+    import numpy as np
+    import time
+
+    nrows, ncols = problema['forma']
+    b = (problema['b'].astype(np.float64)
+         if ecuacion == 'poisson'
+         else np.zeros((nrows, ncols), dtype=np.float64))
+
+    if omega is None:
+        omega = problema['omega_opt']
+
+    u       = np.ascontiguousarray(problema['imagen_baja'].copy(), dtype=np.float64)
+    b       = np.ascontiguousarray(b)
+    mascara = np.ascontiguousarray(problema['mascara'])
+
+    snapshots = []
+    t0 = time.perf_counter()
+
+    snapshots.append(np.clip(u.copy(), 0.0, 1.0))
+
+    iteraciones_totales = 0
+    convergio = False
+    historial_acumulado = []
+
+    for bloque in range(0, max_iter, cada_n_iter):
+        iters_bloque = min(cada_n_iter, max_iter - bloque)
+        u_sol, iters, conv, hist = _kernel_sor_rb(
+            u, b, mascara, float(omega), int(iters_bloque), float(tol)
+        )
+        iteraciones_totales += iters
+        historial_acumulado.extend(hist.tolist())
+
+        snapshots.append(np.clip(u_sol.copy(), 0.0, 1.0))
+
+        if conv:
+            convergio = True
+            break
+
+    tiempo = time.perf_counter() - t0
+
+    return {
+        'imagen_recon': np.clip(u, 0.0, 1.0),
+        'snapshots': snapshots,
+        'iteraciones': iteraciones_totales,
+        'convergio': convergio,
+        'historial': np.array(historial_acumulado),
+        'tiempo': tiempo,
+        'omega': float(omega),
+        'ecuacion': ecuacion,
+        'cada_n_iter': cada_n_iter,
+    }

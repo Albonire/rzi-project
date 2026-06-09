@@ -20,6 +20,7 @@ class VisorImagen(QGraphicsView):
 
     # emite (x, y, w, h) en coords de imagen cuando el usuario suelta el rectangulo
     region_seleccionada = Signal(int, int, int, int)
+    mouse_moved = Signal(int, int)  # Emite (x, y) en coordenadas de imagen
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -31,6 +32,7 @@ class VisorImagen(QGraphicsView):
         self._sel_inicio  = None
         self._sel_rect    = None   # QGraphicsRectItem visible mientras se dibuja
 
+        self.setMouseTracking(True)
         self.setScene(self._escena)
         self.setRenderHint(QPainter.Antialiasing)
         self.setRenderHint(QPainter.SmoothPixmapTransform)
@@ -162,6 +164,17 @@ class VisorImagen(QGraphicsView):
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
+        # Emitir señal de posicion para modo lupa (solo si hay imagen cargada)
+        if self._pixmap_item is not None:
+            scene_pos = self.mapToScene(event.pos())
+            x_img = int(scene_pos.x())
+            y_img = int(scene_pos.y())
+            img_w = int(self._escena.sceneRect().width())
+            img_h = int(self._escena.sceneRect().height())
+            if 0 <= x_img < img_w and 0 <= y_img < img_h:
+                self.mouse_moved.emit(x_img, y_img)
+
+        # Logica existente para modo seleccion rectangular
         if self._modo_sel and self._sel_inicio is not None:
             actual = self.mapToScene(event.pos())
             rect   = QRectF(self._sel_inicio, actual).normalized()
