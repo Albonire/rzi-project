@@ -749,8 +749,11 @@ class VentanaPrincipal(QMainWindow):
         self._hilo_lupa = HiloCalculo(_tarea_lupa)
         self._hilo_lupa.terminado.connect(self._mostrar_lupa)
         self._hilo_lupa.start()
-
-    def _mostrar_lupa(self, imagen_upscaled):
+        
+        def _mostrar_lupa(self, imagen_upscaled):
+        # por si el usuario desactivo el modo lupa mientras se calculaba        
+            if not self._modo_lupa_activo:
+                return
         self.visor_recon.establecer_imagen(imagen_upscaled)
         self.statusBar().showMessage(f'Lupa actualizada: {imagen_upscaled.shape[1]}x{imagen_upscaled.shape[0]} px')
 
