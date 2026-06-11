@@ -9,6 +9,7 @@ Implementa:
 
 import numpy as np
 from PIL import Image
+from scipy.ndimage import convolve
 
 try:
     from skimage.metrics import (peak_signal_noise_ratio as _psnr_fn,
@@ -61,6 +62,48 @@ def ssim(original: np.ndarray, reconstruida: np.ndarray) -> float:
     return float(num / den)
 
 
+def gmsd(original: np.ndarray, reconstruida: np.ndarray) -> float:
+    """
+    Gradient Magnitude Similarity Deviation (Xue et al., 2014).
+
+    Mide directamente la similitud de la ESTRUCTURA (bordes), a diferencia
+    de PSNR (nivel de gris) y SSIM (que mezcla brillo/contraste/estructura).
+    Es especialmente sensible a la nitidez: una imagen borrosa tiene
+    magnitudes de gradiente menores que el original, lo que produce un
+    GMSD alto.
+
+    Procedimiento:
+      1. Se calcula el mapa de magnitud de gradiente de cada imagen con
+         filtros de Prewitt 3x3.
+      2. Se calcula el mapa de similitud puntual
+         GMS = (2*m_o*m_r + c) / (m_o^2 + m_r^2 + c).
+      3. GMSD = desviacion estandar de GMS sobre toda la imagen.
+
+    Valores mas BAJOS indican mejor calidad (0 = identicas). Tipicamente
+    en [0, 0.3] para reconstrucciones razonables.
+    """
+    o = np.asarray(original,     dtype=np.float64)
+    r = np.asarray(reconstruida, dtype=np.float64)
+
+    prewitt_x = np.array([[1, 0, -1],
+                           [1, 0, -1],
+                           [1, 0, -1]], dtype=np.float64) / 3.0
+    prewitt_y = prewitt_x.T
+
+    o_gx = convolve(o, prewitt_x, mode='nearest')
+    o_gy = convolve(o, prewitt_y, mode='nearest')
+    r_gx = convolve(r, prewitt_x, mode='nearest')
+    r_gy = convolve(r, prewitt_y, mode='nearest')
+
+    m_o = np.sqrt(o_gx ** 2 + o_gy ** 2)
+    m_r = np.sqrt(r_gx ** 2 + r_gy ** 2)
+
+    c = 0.0026  # constante de estabilidad (Xue et al.) para imagenes en [0,1]
+    gms = (2 * m_o * m_r + c) / (m_o ** 2 + m_r ** 2 + c)
+
+    return float(np.std(gms))
+
+
 # Linea base: interpolacion bicubica (RF04)
 
 def interpolacion_bicubica(imagen_original: np.ndarray,
@@ -95,12 +138,15 @@ def interpolacion_bicubica(imagen_original: np.ndarray,
 
 # Tabla comparativa (seccion 8.2)
 
-def tabla_comparativa(original:   np.ndarray,
-                      bicubica:   np.ndarray,
-                      laplace:    np.ndarray,
-                      poisson_sor: np.ndarray) -> list:
+def tabla_comparativa(original:      np.ndarray,
+                      bicubica:       np.ndarray,
+                      screened_suave: np.ndarray,
+                      screened_realce: np.ndarray) -> list:
     """
-    Calcula PSNR y SSIM para los tres metodos de reconstruccion.
+    Calcula PSNR, SSIM y GMSD para tres metodos de reconstruccion: bicubica
+    (linea base) y el modelo Poisson "screened" sin amplificacion de
+    gradientes (beta=1, "suave") y con la amplificacion configurada por el
+    usuario ("con realce").
 
     Retorna una lista de dicts lista para mostrar en la interfaz o exportar a CSV.
     """
@@ -109,15 +155,18 @@ def tabla_comparativa(original:   np.ndarray,
             'modelo': 'Bicubica (Pillow)',
             'psnr':   psnr(original, bicubica),
             'ssim':   ssim(original, bicubica),
+            'gmsd':   gmsd(original, bicubica),
         },
         {
-            'modelo': 'Laplace Puro (b=0)',
-            'psnr':   psnr(original, laplace),
-            'ssim':   ssim(original, laplace),
+            'modelo': 'Screened sin realce (beta=1)',
+            'psnr':   psnr(original, screened_suave),
+            'ssim':   ssim(original, screened_suave),
+            'gmsd':   gmsd(original, screened_suave),
         },
         {
-            'modelo': 'Poisson SOR Red-Black',
-            'psnr':   psnr(original, poisson_sor),
-            'ssim':   ssim(original, poisson_sor),
+            'modelo': 'Screened con realce',
+            'psnr':   psnr(original, screened_realce),
+            'ssim':   ssim(original, screened_realce),
+            'gmsd':   gmsd(original, screened_realce),
         },
     ]

@@ -22,10 +22,11 @@ import numpy as np
 import time
 
 try:
-    from numba import njit
+    from numba import njit, prange
     NUMBA_DISPONIBLE = True
 except ImportError:
     NUMBA_DISPONIBLE = False
+    prange = range
 
     def njit(*args, **kwargs):
         """Decorador no-op cuando Numba no esta instalado."""
@@ -100,6 +101,95 @@ def _kernel_sor_rb(u, b, mascara, omega, max_iter, tol):
     return u, iteraciones, convergio, historial[:iteraciones]
 
 
+@njit(cache=True, fastmath=True, parallel=True)
+def _kernel_sor_rb_screened(u, b, lam_map, omega, max_iter, tol):
+    """
+    Kernel SOR Red-Black para la ecuacion de Poisson "screened" (apantallada):
+
+        (4 + lam_map[i,j]) * u[i,j] - sum(vecinos) = b[i,j]
+
+    Esta es la ecuacion de Euler-Lagrange del funcional
+        E(u) = lam * sum_{(i,j) en muestras} (u-f)^2 + sum ||grad(u) - v'||^2
+    El termino `lam_map` ancla los pixeles muestreados (fidelidad de datos)
+    y `b` incluye -div(v') (campo de gradientes amplificado) mas lam*f en
+    los pixeles muestreados. Con lam_map=0 en todas partes se reduce al
+    kernel armonico/Poisson original (diagonal 4).
+
+    A diferencia de _kernel_sor_rb, NO recibe mascara: los bordes (fila/
+    columna 0 y -1) simplemente no se actualizan (quedan en su valor
+    inicial, usado como condicion de frontera tipo Dirichlet con la guia
+    bicubica). Las fases Roja y Negra se paralelizan con prange: dentro de
+    una fase, cada pixel solo lee vecinos del color opuesto, ya finalizados
+    en la fase anterior, por lo que no hay condiciones de carrera.
+
+    Parametros
+    ----------
+    u        : float64 (nrows, ncols), estimacion inicial / solucion in-place
+    b        : float64 (nrows, ncols), termino independiente
+    lam_map  : float64 (nrows, ncols), peso de fidelidad (lam en muestras, 0 si no)
+    omega    : float64, factor de sobrerrelajacion
+    max_iter : int, maximo de iteraciones
+    tol      : float64, tolerancia del residuo RELATIVO ||r||/||b||
+
+    Retorna
+    -------
+    u, iteraciones, convergio, historial (residuo relativo por iteracion)
+    """
+    nrows, ncols = u.shape
+    historial    = np.empty(max_iter, dtype=np.float64)
+    iteraciones  = max_iter
+    convergio    = False
+
+    norm_b = 0.0
+    for i in range(nrows):
+        for j in range(ncols):
+            norm_b += b[i, j] * b[i, j]
+    norm_b = np.sqrt(norm_b)
+    if norm_b < 1e-12:
+        norm_b = 1e-12
+
+    for k in range(max_iter):
+
+        # ---- Fase Roja: (i+j) par ----
+        for i in prange(1, nrows - 1):
+            j_inicio = 2 - (i % 2)
+            for j in range(j_inicio, ncols - 1, 2):
+                diag  = 4.0 + lam_map[i, j]
+                u_gs  = (u[i-1, j] + u[i+1, j]
+                         + u[i, j-1] + u[i, j+1]
+                         + b[i, j]) / diag
+                u[i, j] += omega * (u_gs - u[i, j])
+
+        # ---- Fase Negra: (i+j) impar ----
+        for i in prange(1, nrows - 1):
+            j_inicio = 1 + (i % 2)
+            for j in range(j_inicio, ncols - 1, 2):
+                diag  = 4.0 + lam_map[i, j]
+                u_gs  = (u[i-1, j] + u[i+1, j]
+                         + u[i, j-1] + u[i, j+1]
+                         + b[i, j]) / diag
+                u[i, j] += omega * (u_gs - u[i, j])
+
+        # ---- Residuo relativo (criterio de parada) ----
+        res2 = 0.0
+        for i in prange(1, nrows - 1):
+            for j in range(1, ncols - 1):
+                diag = 4.0 + lam_map[i, j]
+                r = (b[i, j]
+                     - diag * u[i, j]
+                     + u[i-1, j] + u[i+1, j]
+                     + u[i, j-1] + u[i, j+1])
+                res2 += r * r
+        historial[k] = np.sqrt(res2) / norm_b
+
+        if historial[k] < tol:
+            iteraciones = k + 1
+            convergio   = True
+            break
+
+    return u, iteraciones, convergio, historial[:iteraciones]
+
+
 def _calentamiento():
     """Fuerza la compilacion JIT de Numba con una malla de juguete."""
     u  = np.zeros((8, 8),  dtype=np.float64)
@@ -107,6 +197,9 @@ def _calentamiento():
     m  = np.zeros((8, 8),  dtype=np.bool_)
     m[0, :] = m[-1, :] = m[:, 0] = m[:, -1] = True
     _kernel_sor_rb(u, b, m, 1.5, 5, 1e-2)
+
+    lam = np.zeros((8, 8), dtype=np.float64)
+    _kernel_sor_rb_screened(u.copy(), b, lam, 1.5, 5, 1e-2)
 
 
 def resolver(problema: dict, omega: float = None, tol: float = 1e-6,
@@ -160,6 +253,49 @@ def resolver(problema: dict, omega: float = None, tol: float = 1e-6,
         'tiempo':       tiempo,
         'omega':        float(omega),
         'ecuacion':     ecuacion,
+    }
+
+
+def resolver_screened(problema: dict, omega: float = None, tol: float = 1e-4,
+                       max_iter: int = 600) -> dict:
+    """
+    Resuelve el problema de Poisson "screened" (apantallado) construido por
+    poisson_builder.construir_problema_screened().
+
+    A diferencia de resolver(), no usa 'mascara' ni el argumento 'ecuacion':
+    el problema ya trae 'b' (incluye -div(v') + lam*f en las muestras) y
+    'lam_map' (peso de fidelidad por pixel). El criterio de parada es el
+    residuo RELATIVO ||r||/||b|| < tol (mas robusto que el residuo absoluto
+    para mallas grandes, donde el piso de precision de float64 hace que un
+    residuo absoluto muy pequeno nunca se alcance).
+
+    Retorna el mismo formato que resolver(), mas 'lam' (valor representativo
+    usado para omega_opt).
+    """
+    nrows, ncols = problema['forma']
+
+    if omega is None:
+        omega = problema['omega_opt']
+
+    u       = np.ascontiguousarray(problema['imagen_baja'].copy(), dtype=np.float64)
+    b       = np.ascontiguousarray(problema['b'], dtype=np.float64)
+    lam_map = np.ascontiguousarray(problema['lam_map'], dtype=np.float64)
+
+    t0 = time.perf_counter()
+    u_sol, iters, convergio, historial = _kernel_sor_rb_screened(
+        u, b, lam_map, float(omega), int(max_iter), float(tol)
+    )
+    tiempo = time.perf_counter() - t0
+
+    return {
+        'imagen_recon': np.clip(u_sol, 0.0, 1.0),
+        'iteraciones':  int(iters),
+        'convergio':    bool(convergio),
+        'historial':    historial,
+        'tiempo':       tiempo,
+        'omega':        float(omega),
+        'ecuacion':     'screened',
+        'lam':          problema.get('lam', 0.0),
     }
 
 

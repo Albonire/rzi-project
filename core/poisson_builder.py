@@ -90,11 +90,11 @@ def construir_problema(imagen_gris: np.ndarray, factor: int = 4) -> dict:
     mascara[:, 0]  = True
     mascara[:, -1] = True
 
-    # --- Imagen de baja resolucion (pixeles desconocidos valen cero) ---
+    # --- imagen de baja resolucion (pixeles desconocidos valen cero) ---
     imagen_baja = np.zeros((nrows, ncols), dtype=np.float64)
     imagen_baja[mascara] = imagen_gris[mascara]
 
-    # --- Campo guia para la divergencia (Poisson b vector) ---
+    # --- campo guia para la divergencia (Poisson b vector) ---
     # Rellenar pixeles desconocidos con el vecino conocido mas cercano antes
     # de calcular gradientes. Esto evita los artefactos que genera operar
     # sobre los ceros de imagen_baja (mitigacion del riesgo, seccion 10).
@@ -218,4 +218,179 @@ def construir_problema_upscale(tile: np.ndarray, factor: int = 4) -> dict:
         'forma':           (new_h, new_w),
         'omega_opt':       calcular_omega_optimo(new_h, new_w),
         'factor':          factor,
+    }
+
+
+def _preparar_guia_bicubica(tile: np.ndarray, factor: int) -> tuple:
+    """
+    Helper compartido: aplica el tope de memoria/rendimiento, construye la
+    malla fina alineada por esquinas y devuelve la guia bicubica G.
+
+    Retorna (tile_ajustado, G, new_h, new_w).
+    """
+    if tile.ndim != 2:
+        raise ValueError("Se espera tile 2D en escala de grises.")
+
+    h, w = tile.shape
+
+    MAX_PIXELS = 1_200_000
+    MAX_LADO   = 1200
+    new_h_pre  = (h - 1) * factor + 1
+    new_w_pre  = (w - 1) * factor + 1
+
+    if new_h_pre * new_w_pre > MAX_PIXELS or max(new_h_pre, new_w_pre) > MAX_LADO:
+        escala = min(
+            (MAX_PIXELS / (new_h_pre * new_w_pre)) ** 0.5,
+            MAX_LADO / max(new_h_pre, new_w_pre),
+        )
+        h_small = max(2, (int(new_h_pre * escala) - 1) // factor + 1)
+        w_small = max(2, (int(new_w_pre * escala) - 1) // factor + 1)
+        pil_small = Image.fromarray(
+            (np.clip(tile, 0.0, 1.0) * 255).astype(np.uint8), mode='L')
+        pil_small = pil_small.resize((w_small, h_small), Image.LANCZOS)
+        tile = np.asarray(pil_small, dtype=np.float64) / 255.0
+        h, w = tile.shape
+
+    new_h = (h - 1) * factor + 1
+    new_w = (w - 1) * factor + 1
+
+    pil_tile = Image.fromarray(
+        (np.clip(tile, 0.0, 1.0) * 255).astype(np.uint8), mode='L')
+    pil_guia = pil_tile.resize((new_w, new_h), Image.BICUBIC)
+    G = np.asarray(pil_guia, dtype=np.float64) / 255.0
+
+    return tile, G, new_h, new_w
+
+
+def amplified_guidance(G: np.ndarray, beta: float = 1.7, tau: float = 0.02,
+                        sigma_noise: float = 0.6) -> tuple:
+    """
+    Calcula el campo de gradientes amplificado v' = s(||v||) * v
+    (seccion B del documento "Analisis Critico y Mejora del Proyecto RZI").
+
+    Antes de derivar se suaviza G con un Gaussiano (sigma_noise) para que la
+    amplificacion no dispare el ruido de alta frecuencia junto con los bordes
+    reales.
+
+    s(t) = 1 + (beta - 1) * t / (t + tau)
+
+    Para gradientes grandes (bordes reales, t >> tau) s(t) -> beta: se
+    amplifica el contraste del borde. Para gradientes pequenos (ruido o zonas
+    planas, t << tau) s(t) -> 1: no se amplifica nada.
+
+    Las derivadas son diferencias hacia adelante (gx[i,j] = G[i,j+1]-G[i,j]),
+    con el ultimo renglon/columna en cero. Esta convencion es la que hace
+    consistente a divergence() como el laplaciano de 5 puntos cuando
+    v = gradiente(G) sin amplificar.
+
+    Retorna (gx_amp, gy_amp), mismas dimensiones que G.
+    """
+    Gs = gaussian_filter(G, sigma=sigma_noise) if sigma_noise > 0 else G
+
+    gx = np.zeros_like(Gs)
+    gy = np.zeros_like(Gs)
+    gx[:, :-1] = Gs[:, 1:] - Gs[:, :-1]
+    gy[:-1, :] = Gs[1:, :] - Gs[:-1, :]
+
+    mag = np.sqrt(gx * gx + gy * gy)
+    s   = 1.0 + (beta - 1.0) * mag / (mag + tau)
+
+    return s * gx, s * gy
+
+
+def divergence(gx: np.ndarray, gy: np.ndarray) -> np.ndarray:
+    """
+    Divergencia discreta de un campo vectorial (gx, gy), usando diferencias
+    hacia atras: div[i,j] = (gx[i,j]-gx[i,j-1]) + (gy[i,j]-gy[i-1,j]).
+
+    Esta convencion (diferencias adelante para el gradiente, atras para la
+    divergencia) reproduce exactamente el laplaciano de 5 puntos cuando
+    (gx, gy) = gradiente(G) sin amplificar:
+        divergence(gradiente(G))[i,j] == G[i,j+1]+G[i,j-1]+G[i+1,j]+G[i-1,j] - 4*G[i,j]
+    """
+    gx_prev = np.zeros_like(gx)
+    gy_prev = np.zeros_like(gy)
+    gx_prev[:, 1:] = gx[:, :-1]
+    gy_prev[1:, :] = gy[:-1, :]
+
+    return (gx - gx_prev) + (gy - gy_prev)
+
+
+def omega_opt_screened(n: int, lam: float) -> float:
+    """
+    Parametro de relajacion optimo para SOR aplicado al operador "screened"
+    (diagonal 4+lambda en vez de 4), seccion 3.3 del documento.
+
+    El radio espectral de Jacobi para este operador es
+        rho_J = (4 / (4 + lambda)) * cos(pi / (n + 1))
+    y de alli
+        omega_opt = 2 / (1 + sqrt(1 - rho_J^2))
+
+    Cuando lambda -> 0 esta formula se reduce a calcular_omega_optimo().
+    """
+    rho_j = (4.0 / (4.0 + lam)) * np.cos(np.pi / (n + 1))
+    return 2.0 / (1.0 + np.sqrt(1.0 - rho_j * rho_j))
+
+
+def construir_problema_screened(tile: np.ndarray, factor: int = 4,
+                                 lam: float = 8.0, beta: float = 1.7,
+                                 tau: float = 0.02) -> dict:
+    """
+    Construye el problema de Poisson "screened" (apantallado) con
+    amplificacion adaptativa de gradientes, seccion B del documento
+    "Analisis Critico y Mejora del Proyecto RZI".
+
+    A diferencia de construir_problema_upscale (que fija con condicion de
+    Dirichlet dura los pixeles conocidos via 'mascara'), aqui los pixeles
+    conocidos se anclan de forma SUAVE mediante 'lam_map': un termino de
+    fidelidad lambda*(u-f) que penaliza pero no obliga, eliminando el
+    artefacto de "dimples" causado por discontinuidades duras.
+
+    PDE resuelta en cada pixel:
+        (4 + lam_map[i,j]) * u[i,j] - (suma de los 4 vecinos) = b[i,j]
+    con
+        b = -divergence(amplified_guidance(G)) + lam_map * f
+    donde f vale el valor de muestra conocido en los pixeles de la malla
+    que coinciden con el tile original, y 0 en el resto (lam_map tambien es
+    0 alli, asi que el producto no afecta).
+
+    Parametros
+    ----------
+    tile : ndarray float64 [0,1], shape (h, w)
+    factor : int, factor de ampliacion.
+    lam : float, peso de fidelidad en los pixeles muestreados.
+    beta : float, ganancia maxima de amplificacion de bordes (beta > 1).
+    tau : float, umbral de magnitud de gradiente bajo el cual no se amplifica.
+
+    Retorna
+    -------
+    dict con las claves:
+        'imagen_original', 'imagen_baja' : la guia bicubica G (warm start).
+        'lam_map'   : ndarray float64, lambda en las muestras conocidas, 0 resto.
+        'b'         : ndarray float64, lado derecho de la ecuacion.
+        'forma'     : (new_h, new_w).
+        'omega_opt' : omega optimo para el operador screened.
+        'factor'    : factor de ampliacion.
+        'lam'       : valor de lambda usado (para referencia/diagnostico).
+    """
+    tile, G, new_h, new_w = _preparar_guia_bicubica(tile, factor)
+
+    lam_map = np.zeros((new_h, new_w), dtype=np.float64)
+    lam_map[::factor, ::factor] = lam
+
+    gx, gy = amplified_guidance(G, beta=beta, tau=tau)
+    b = -divergence(gx, gy)
+    b[::factor, ::factor] += lam * tile
+
+    n = min(new_h, new_w)
+
+    return {
+        'imagen_original': G,
+        'imagen_baja':     G.copy(),
+        'lam_map':         lam_map,
+        'b':               b,
+        'forma':           (new_h, new_w),
+        'omega_opt':       omega_opt_screened(n, lam),
+        'factor':          factor,
+        'lam':             lam,
     }

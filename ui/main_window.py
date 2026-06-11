@@ -36,10 +36,12 @@ import matplotlib.pyplot as plt
 
 from ui.zoom_viewer import VisorImagen
 from core.poisson_builder import (construir_problema, construir_problema_upscale,
+                                   construir_problema_screened,
                                    imagen_a_grises, calcular_omega_optimo)
-from core.sor_solver import (resolver, barrido_omega as _barrido,
+from core.sor_solver import (resolver, resolver_screened, barrido_omega as _barrido,
                               benchmark_numba_vs_python, NUMBA_DISPONIBLE,
                               _calentamiento, resolver_con_snapshots)
+from core.upscaler import upscale_poisson_screened, anti_ringing
 from services.metrics import (psnr, ssim, interpolacion_bicubica, tabla_comparativa)
 from services.exporter import (guardar_imagen, exportar_csv,
                                 grafica_convergencia, grafica_barrido_omega,
@@ -222,7 +224,7 @@ class PanelParametros(QWidget):
         sl.addWidget(QLabel('Tolerancia:'), 0, 0)
         self.spin_tol = QDoubleSpinBox()
         self.spin_tol.setDecimals(8)
-        self.spin_tol.setRange(1e-10, 1e-2)
+        self.spin_tol.setRange(1e-7, 1e-2)
         self.spin_tol.setValue(1e-5)
         self.spin_tol.setSingleStep(1e-6)
         sl.addWidget(self.spin_tol, 0, 1)
@@ -252,20 +254,83 @@ class PanelParametros(QWidget):
 
         lay.addWidget(g_solver)
 
-        
+
         g_sharp = QGroupBox('Nitidez (USM)')
         nl = QGridLayout(g_sharp)
         nl.setSpacing(6)
         nl.addWidget(QLabel('Fuerza (%):'), 0, 0)
         self.spin_usm = QSpinBox()
         self.spin_usm.setRange(0, 300)
-        self.spin_usm.setValue(150)
+        self.spin_usm.setValue(60)
         self.spin_usm.setSingleStep(25)
-        self.spin_usm.setToolTip('0 = sin realce; 150 = nitidez media; 300 = maxima')
+        self.spin_usm.setToolTip(
+            '0 = sin realce; 60 = toque suave (recomendado, el modelo '
+            'screened ya realza con beta); 150+ = fuerte, puede generar halos')
         nl.addWidget(self.spin_usm, 0, 1)
         lay.addWidget(g_sharp)
 
-        
+
+        g_screened = QGroupBox('Nitidez Adaptativa (Screened Poisson)')
+        scl = QGridLayout(g_screened)
+        scl.setSpacing(6)
+
+        scl.addWidget(QLabel('Lambda (fidelidad):'), 0, 0)
+        self.spin_lam = QDoubleSpinBox()
+        self.spin_lam.setDecimals(2)
+        self.spin_lam.setRange(0.5, 50.0)
+        self.spin_lam.setValue(8.0)
+        self.spin_lam.setSingleStep(0.5)
+        self.spin_lam.setToolTip(
+            'peso del anclaje suave a las muestras conocidas; mayor lambda '
+            '= mas fiel a la guia bicubica, menor = mas libre la PDE')
+        scl.addWidget(self.spin_lam, 0, 1)
+
+        scl.addWidget(QLabel('Beta (amplificacion):'), 1, 0)
+        self.spin_beta = QDoubleSpinBox()
+        self.spin_beta.setDecimals(2)
+        self.spin_beta.setRange(1.0, 3.0)
+        self.spin_beta.setValue(1.7)
+        self.spin_beta.setSingleStep(0.1)
+        self.spin_beta.setToolTip(
+            'ganancia maxima sobre los gradientes de bordes reales (1 = sin '
+            'amplificacion)')
+        scl.addWidget(self.spin_beta, 1, 1)
+
+        scl.addWidget(QLabel('Tau (umbral):'), 2, 0)
+        self.spin_tau = QDoubleSpinBox()
+        self.spin_tau.setDecimals(3)
+        self.spin_tau.setRange(0.001, 0.2)
+        self.spin_tau.setValue(0.02)
+        self.spin_tau.setSingleStep(0.005)
+        self.spin_tau.setToolTip(
+            'magnitud de gradiente bajo la cual no se amplifica (evita '
+            'realzar ruido)')
+        scl.addWidget(self.spin_tau, 2, 1)
+
+        scl.addWidget(QLabel('Multiescala:'), 3, 0)
+        self.chk_multiescala = QCheckBox()
+        self.chk_multiescala.setChecked(True)
+        self.chk_multiescala.setToolTip(
+            'resuelve en cascada coarse-to-fine (factores potencia de 2)')
+        scl.addWidget(self.chk_multiescala, 3, 1)
+
+        scl.addWidget(QLabel('Back-projection:'), 4, 0)
+        self.chk_back_projection = QCheckBox()
+        self.chk_back_projection.setChecked(True)
+        self.chk_back_projection.setToolTip(
+            'fuerza que la imagen reducida coincida con la original')
+        scl.addWidget(self.chk_back_projection, 4, 1)
+
+        scl.addWidget(QLabel('Anti-ringing:'), 5, 0)
+        self.chk_anti_ringing = QCheckBox()
+        self.chk_anti_ringing.setChecked(True)
+        self.chk_anti_ringing.setToolTip(
+            'recorta el resultado a los limites locales de la guia bicubica')
+        scl.addWidget(self.chk_anti_ringing, 5, 1)
+
+        lay.addWidget(g_screened)
+
+
         self.btn_reconstruir = QPushButton('Reconstruir (Poisson SOR)')
         self.btn_reconstruir.setObjectName('btn_principal')
         self.btn_reconstruir.setMinimumHeight(36)
@@ -317,6 +382,12 @@ class PanelParametros(QWidget):
             # none = usar omega optimo calculado automaticamente
             'omega':    None if self.chk_omega_auto.isChecked() else self.spin_omega.value(),
             'usm_pct':  self.spin_usm.value(),
+            'lam':              self.spin_lam.value(),
+            'beta':             self.spin_beta.value(),
+            'tau':              self.spin_tau.value(),
+            'multiescala':      self.chk_multiescala.isChecked(),
+            'back_projection':  self.chk_back_projection.isChecked(),
+            'anti_ringing':     self.chk_anti_ringing.isChecked(),
         }
 
     def deshabilitar(self, flag: bool):
@@ -342,8 +413,19 @@ class PanelResultados(QWidget):
         # tab comparacion: muestra las 4 imagenes con metricas
         self._tab_comp = QWidget()
         lay_comp = QVBoxLayout(self._tab_comp)
+
         self.canvas_comp = FigureCanvas(Figure(figsize=(10, 3), facecolor='#252525'))
         lay_comp.addWidget(self.canvas_comp)
+
+        lay_comp.addWidget(QLabel('Metricas de Calidad:'))
+        self.tabla_metricas_comp = QTableWidget(0, 5)
+        self.tabla_metricas_comp.setHorizontalHeaderLabels(
+            ['Modelo', 'PSNR (dB)', 'SSIM', 'GMSD', 'Info Solver'])
+        self.tabla_metricas_comp.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.tabla_metricas_comp.setAlternatingRowColors(True)
+        self.tabla_metricas_comp.setMaximumHeight(120)
+        lay_comp.addWidget(self.tabla_metricas_comp)
+
         self.tabs.addTab(self._tab_comp, 'Comparacion')
 
         # tab convergencia: residuo vs iteraciones
@@ -363,9 +445,9 @@ class PanelResultados(QWidget):
         # tab metricas: tabla con psnr/ssim
         self._tab_met = QWidget()
         lay_met = QVBoxLayout(self._tab_met)
-        self.tabla_metricas = QTableWidget(0, 4)
+        self.tabla_metricas = QTableWidget(0, 5)
         self.tabla_metricas.setHorizontalHeaderLabels(
-            ['Modelo', 'PSNR (dB)', 'SSIM', 'Solver'])
+            ['Modelo', 'PSNR (dB)', 'SSIM', 'GMSD', 'Solver'])
         self.tabla_metricas.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.tabla_metricas.setAlternatingRowColors(True)
         lay_met.addWidget(self.tabla_metricas)
@@ -383,10 +465,34 @@ class PanelResultados(QWidget):
 
     # actualizar cada tab
 
-    def mostrar_comparacion(self, original, bicubica, laplace, poisson, tabla):
+    def mostrar_comparacion(self, original, bicubica, laplace, poisson, tabla,
+                             res_poi=None):
         fig = grafica_comparacion_4modelos(original, bicubica, laplace, poisson, tabla)
         self._renderizar_en(self.canvas_comp, fig)
         plt.close(fig)
+
+        self.tabla_metricas_comp.setRowCount(0)
+        info_solver = [
+            '',
+            '',
+            (f"iter={res_poi.get('iteraciones','--')}"
+             f" t={res_poi.get('tiempo', 0):.3f}s"
+             f" omega={res_poi.get('omega', 0):.4f}"
+             f" conv={'Si' if res_poi.get('convergio') else 'No'}")
+        ] if res_poi else ['', '', '']
+        for fila, info in zip(tabla, info_solver):
+            row = self.tabla_metricas_comp.rowCount()
+            self.tabla_metricas_comp.insertRow(row)
+            psnr_v = fila.get('psnr', 0)
+            ssim_v = fila.get('ssim', 0)
+            gmsd_v = fila.get('gmsd', 0)
+            self.tabla_metricas_comp.setItem(row, 0, QTableWidgetItem(fila.get('modelo', '')))
+            self.tabla_metricas_comp.setItem(row, 1, QTableWidgetItem(
+                'inf' if psnr_v == float('inf') else f'{psnr_v:.2f}'))
+            self.tabla_metricas_comp.setItem(row, 2, QTableWidgetItem(f'{ssim_v:.4f}'))
+            self.tabla_metricas_comp.setItem(row, 3, QTableWidgetItem(f'{gmsd_v:.4f}'))
+            self.tabla_metricas_comp.setItem(row, 4, QTableWidgetItem(info))
+
         self.tabs.setCurrentIndex(0)
 
     def mostrar_convergencia(self, historial: np.ndarray, omega: float):
@@ -419,11 +525,13 @@ class PanelResultados(QWidget):
             self.tabla_metricas.insertRow(row)
             psnr_v = fila.get('psnr', 0)
             ssim_v = fila.get('ssim', 0)
+            gmsd_v = fila.get('gmsd', 0)
             self.tabla_metricas.setItem(row, 0, QTableWidgetItem(fila.get('modelo', '')))
             self.tabla_metricas.setItem(row, 1, QTableWidgetItem(
                 'inf' if psnr_v == float('inf') else f'{psnr_v:.2f}'))
             self.tabla_metricas.setItem(row, 2, QTableWidgetItem(f'{ssim_v:.4f}'))
-            self.tabla_metricas.setItem(row, 3, QTableWidgetItem(info))
+            self.tabla_metricas.setItem(row, 3, QTableWidgetItem(f'{gmsd_v:.4f}'))
+            self.tabla_metricas.setItem(row, 4, QTableWidgetItem(info))
         self.tabs.setCurrentIndex(3)
 
     def mostrar_benchmark(self, resultados: list):
@@ -462,7 +570,15 @@ class PanelResultados(QWidget):
             for img in ax_src.get_images():
                 ax_dst.imshow(img.get_array(), cmap=img.get_cmap(),
                               vmin=img.norm.vmin, vmax=img.norm.vmax,
-                              aspect='auto', interpolation='nearest')
+                              aspect='equal', interpolation='nearest')
+
+            title_visible = ax_src.title.get_visible()
+            xlabel_visible = ax_src.xaxis.get_label().get_visible()
+            ylabel_visible = ax_src.yaxis.get_label().get_visible()
+            ticks_visible = any(tick.get_visible() for tick in ax_src.get_xticklabels())
+            axis_off = not (title_visible or xlabel_visible or ylabel_visible or ticks_visible)
+            if axis_off:
+                ax_dst.axis('off')
 
             # estilos del tema oscuro
             ax_dst.set_facecolor('#252525')
@@ -537,7 +653,7 @@ class VentanaPrincipal(QMainWindow):
 
         # visor izquierdo: imagen original
         col_orig = QVBoxLayout()
-        lbl_orig = QLabel('Original  (zoom con rueda, reconstruye la region visible)')
+        lbl_orig = QLabel('Original  (zoom con rueda y arrastre)')
         lbl_orig.setStyleSheet('color: #2196F3; font-weight: bold; padding: 2px;')
         lbl_orig.setAlignment(Qt.AlignCenter)
         self.visor_orig = VisorImagen()
@@ -546,15 +662,15 @@ class VentanaPrincipal(QMainWindow):
 
         # visor derecho: imagen reconstruida / agrandada
         col_recon = QVBoxLayout()
-        lbl_recon = QLabel('Reconstruida  (region visible refinada con SOR armonico, imagen completa)')
+        lbl_recon = QLabel('Reconstruida  (imagen completa, mismo zoom - realce SOR)')
         lbl_recon.setStyleSheet('color: #4CAF50; font-weight: bold; padding: 2px;')
         lbl_recon.setAlignment(Qt.AlignCenter)
         self.visor_recon = VisorImagen()
         col_recon.addWidget(lbl_recon)
         col_recon.addWidget(self.visor_recon)
 
-        visores_lay.addLayout(col_orig)
-        visores_lay.addLayout(col_recon)
+        visores_lay.addLayout(col_orig, 1)
+        visores_lay.addLayout(col_recon, 1)
         cen_l.addLayout(visores_lay)
 
         # barra de progreso (oculta en reposo)
@@ -740,20 +856,21 @@ class VentanaPrincipal(QMainWindow):
             return
 
         factor = 3
+        params = self.panel_params.obtener_params()
 
-        def _tarea_lupa(t=tile, f=factor):
-            problema = construir_problema_upscale(t, f)
-            res = resolver(problema, ecuacion='laplace', max_iter=400, tol=1e-4)
+        def _tarea_lupa(t=tile, f=factor, p=params):
+            problema = construir_problema_screened(t, f, lam=p['lam'],
+                                                     beta=p['beta'], tau=p['tau'])
+            res = resolver_screened(problema, max_iter=400, tol=1e-4)
             return res['imagen_recon']
 
         self._hilo_lupa = HiloCalculo(_tarea_lupa)
         self._hilo_lupa.terminado.connect(self._mostrar_lupa)
         self._hilo_lupa.start()
-        
-        def _mostrar_lupa(self, imagen_upscaled):
-        # por si el usuario desactivo el modo lupa mientras se calculaba        
-            if not self._modo_lupa_activo:
-                return
+
+    def _mostrar_lupa(self, imagen_upscaled):
+        if not self._modo_lupa_activo:
+            return
         self.visor_recon.establecer_imagen(imagen_upscaled)
         self.statusBar().showMessage(f'Lupa actualizada: {imagen_upscaled.shape[1]}x{imagen_upscaled.shape[0]} px')
 
@@ -858,6 +975,62 @@ class VentanaPrincipal(QMainWindow):
         actualizar_frame(0)
         dialogo.exec()
 
+    # helper compartido: ampliacion para mostrar (Reconstruir y Comparar)
+
+    def _upscale_display(self, tile: np.ndarray, factor: int, params: dict) -> dict:
+        """
+        Ejecuta el pipeline screened y produce la imagen AMPLIADA lista para
+        mostrar (sin reducir de vuelta al tamaño del tile ni incrustar).
+
+        Aplica USM (si fuerza>0) y, al final, anti-ringing contra una guia
+        bicubica del mismo tamaño: esto recorta el overshoot del USM
+        (el "halo" blanco) sin perder el realce del modelo screened.
+        """
+        res = upscale_poisson_screened(
+            tile, factor,
+            lam=params['lam'], beta=params['beta'], tau=params['tau'],
+            usar_back_projection=params['back_projection'],
+            usar_anti_ringing=params['anti_ringing'],
+            usar_multiescala=params['multiescala'],
+            tol=params['tol'], max_iter=params['max_iter'],
+        )
+        big = res['imagen_recon']
+        new_h, new_w = big.shape
+
+        th, tw = tile.shape
+        sor_h_fit = th * factor
+        sor_w_fit = tw * factor
+
+        pil_big = Image.fromarray(
+            (np.clip(big, 0.0, 1.0) * 255).astype(np.uint8), mode='L')
+        if (new_w, new_h) != (sor_w_fit, sor_h_fit):
+            pil_big = pil_big.resize((sor_w_fit, sor_h_fit), Image.LANCZOS)
+
+        pil_tile = Image.fromarray(
+            (np.clip(tile, 0.0, 1.0) * 255).astype(np.uint8), mode='L')
+        bic = np.array(pil_tile.resize((sor_w_fit, sor_h_fit), Image.BICUBIC),
+                       dtype=np.float64) / 255.0
+        nn = np.array(pil_tile.resize((sor_w_fit, sor_h_fit), Image.NEAREST),
+                      dtype=np.float64) / 255.0
+
+        usm_pct = params['usm_pct']
+        if usm_pct > 0:
+            pil_big = pil_big.filter(
+                ImageFilter.UnsharpMask(radius=1.5, percent=usm_pct, threshold=2))
+
+        display = np.array(pil_big, dtype=np.float64) / 255.0
+        # anti-ringing AL FINAL: recorta el overshoot del USM al rango local
+        # de la guia bicubica, sin deshacer el realce de beta.
+        display = anti_ringing(display, bic)
+
+        return {
+            'display':      display,
+            'res':          res,
+            'nn':           nn,
+            'bicubica':     bic,
+            'forma_salida': (sor_h_fit, sor_w_fit),
+        }
+
     # reconstruccion poisson sor
 
     def _reconstruir(self):
@@ -866,67 +1039,28 @@ class VentanaPrincipal(QMainWindow):
             return
 
         tile, tx, ty, tw, th = info
-        params       = self.panel_params.obtener_params()
-        img_completa = self._imagen_orig.copy()
+        params = self.panel_params.obtener_params()
 
         def _tarea():
             factor = params['factor']
 
-            # upscaling con laplace armonico (b=0)
-            problema = construir_problema_upscale(tile, factor)
-            res      = resolver(problema,
-                                omega=params['omega'],
-                                tol=params['tol'],
-                                max_iter=params['max_iter'],
-                                ecuacion='laplace')
-            new_h, new_w = problema['forma']
-            big = res['imagen_recon']
-
-            # USM aplicado a resolucion ampliada; radius escalado por factor
-            # para equivalencia perceptual (radio fisico = 2 px del tile original)
-            pil_big = Image.fromarray(
-                (np.clip(big, 0.0, 1.0) * 255).astype(np.uint8), mode='L')
-            usm_pct = params['usm_pct']
-            if usm_pct > 0:
-                pil_big = pil_big.filter(
-                    ImageFilter.UnsharpMask(radius=2 * factor,
-                                           percent=usm_pct, threshold=2))
-
-            # ajustar SOR a tamano exacto th*factor x tw*factor para embedding limpio
-            sor_h_fit = th * factor
-            sor_w_fit = tw * factor
-            if (new_w, new_h) != (sor_w_fit, sor_h_fit):
-                pil_big = pil_big.resize((sor_w_fit, sor_h_fit), Image.LANCZOS)
-            sor_fit = np.array(pil_big, dtype=np.float64) / 255.0
-
-            # contexto: extraer region con padding y upscalar con BICUBIC
-            # asi el visor derecho muestra la region reconstruida + entorno
-            pad = max(20, min(th // 3, tw // 3))
-            ctx_x0 = max(0, tx - pad)
-            ctx_y0 = max(0, ty - pad)
-            ctx_x1 = min(img_completa.shape[1], tx + tw + pad)
-            ctx_y1 = min(img_completa.shape[0], ty + th + pad)
-            ctx_orig = img_completa[ctx_y0:ctx_y1, ctx_x0:ctx_x1]
-            ctx_h_o, ctx_w_o = ctx_orig.shape
-
-            pil_ctx     = Image.fromarray((ctx_orig * 255).astype(np.uint8), mode='L')
-            pil_ctx_big = pil_ctx.resize((ctx_w_o * factor, ctx_h_o * factor),
-                                         Image.BICUBIC)
-            ctx_big = np.array(pil_ctx_big, dtype=np.float64) / 255.0
-
-            # incrustar resultado SOR en el contexto bicubico
-            oy = (ty - ctx_y0) * factor
-            ox = (tx - ctx_x0) * factor
-            ctx_big[oy:oy + sor_h_fit, ox:ox + sor_w_fit] = sor_fit
+            # upscaling con poisson "screened" + amplificacion adaptativa
+            # de gradientes (lam_map ancla suavemente las muestras conocidas,
+            # sin las discontinuidades duras que causaban el patron de
+            # "puntitos" del modelo armonico anterior)
+            disp = self._upscale_display(tile, factor, params)
+            res  = disp['res']
 
             return {
-                'imagen_visor':  ctx_big,
-                'imagen_upscale': big,
-                'resultado':     res,
-                'tile_original': tile,
-                'region':        (tx, ty, tw, th),
-                'forma_salida':  (new_h, new_w),
-                'factor':        factor,
+                'imagen_upscale':  disp['display'],
+                'resultado':       res,
+                'tile_original':   tile,
+                'region':          (tx, ty, tw, th),
+                'forma_salida':    disp['forma_salida'],
+                'factor':          factor,
+                'detalle_nn':       disp['nn'],
+                'detalle_bicubica': disp['bicubica'],
+                'detalle_sor':      disp['display'],
             }
 
         ok = self._iniciar_hilo(_tarea)
@@ -934,9 +1068,13 @@ class VentanaPrincipal(QMainWindow):
             return
 
         self.statusBar().showMessage(
-            f'Reconstruyendo Poisson SOR (armonico) region '
+            f'Reconstruyendo Poisson SOR (screened) region '
             f'({tx},{ty}) {tw}x{th} px  ->  x{params["factor"]}...')
 
+        try:
+            self._hilo.terminado.disconnect()
+        except Exception:
+            pass
         self._hilo.terminado.connect(self._mostrar_reconstruccion)
 
     def _mostrar_reconstruccion(self, datos: dict):
@@ -944,20 +1082,75 @@ class VentanaPrincipal(QMainWindow):
         res    = datos['resultado']
         factor = datos['factor']
 
-        # mostrar composite upscalado (SOR en centro + contexto bicubico)
-        # ajustar_a_ventana() ya es llamado por establecer_imagen; no copiar zoom
-        # porque el visor derecho muestra la region x factor mas grande
-        self.visor_recon.establecer_imagen(datos['imagen_visor'])
+        # imagen ampliada real (misma que el dialogo de detalle): el visor
+        # izquierdo sigue mostrando la region original (zoom nativo) y el
+        # derecho la ampliacion suave del modelo screened, sin embed/reduccion
+        self.visor_recon.establecer_imagen(datos['imagen_upscale'])
 
         self.panel_res.mostrar_convergencia(res['historial'], res['omega'])
 
         tx, ty, tw, th = datos['region']
         nh, nw = datos['forma_salida']
+        etapas_txt = 'x'.join(str(e) for e in res.get('etapas', [factor]))
         self.statusBar().showMessage(
-            f"SOR armonico x{factor}  |  {tw}x{th} px -> {nw}x{nh}  "
-            f"|  iter={res['iteraciones']}  t={res['tiempo']:.3f}s  "
+            f"Poisson SOR screened x{factor} (etapas {etapas_txt})  |  "
+            f"region ({tx},{ty}) {tw}x{th} px  "
+            f"->  ampliacion {nw}x{nh}  |  "
+            f"iter={res['iteraciones']}  t={res['tiempo']:.3f}s  "
             f"omega={res['omega']:.4f}  "
             f"conv={'Si' if res['convergio'] else 'No (aumentar max_iter)'}")
+
+        # dialogo de comparacion en detalle: zoom nativo vs bicubica vs SOR
+        self._mostrar_dialogo_detalle(datos)
+
+    def _mostrar_dialogo_detalle(self, datos: dict):
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QPushButton
+
+        factor = datos['factor']
+        tx, ty, tw, th = datos['region']
+
+        dialogo = QDialog(self)
+        dialogo.setWindowTitle('Comparacion en detalle: zoom nativo vs Poisson SOR')
+        dialogo.setStyleSheet(ESTILO)
+        dialogo.resize(1000, 460)
+
+        layout = QVBoxLayout(dialogo)
+
+        lbl_info = QLabel(
+            f"Region ({tx},{ty}) {tw}x{th} px ampliada x{factor}. La columna "
+            f"izquierda es el zoom nativo (vecino mas proximo, con bloques "
+            f"pixelados). La derecha es la reconstruccion Poisson SOR "
+            f"screened: anclaje suave a las muestras conocidas (lambda) mas "
+            f"amplificacion adaptativa de gradientes en los bordes (beta), "
+            f"sin los bloques del zoom nativo.")
+        lbl_info.setWordWrap(True)
+        lbl_info.setStyleSheet('color: #B0B0B0; padding: 4px;')
+        layout.addWidget(lbl_info)
+
+        fila = QHBoxLayout()
+        for titulo, color, img in (
+            ('Zoom nativo (vecino mas proximo)', '#F44336', datos['detalle_nn']),
+            ('Bicubica', '#FF9800', datos['detalle_bicubica']),
+            (f'Poisson SOR screened x{factor}', '#4CAF50', datos['detalle_sor']),
+        ):
+            col = QVBoxLayout()
+            lbl = QLabel(titulo)
+            lbl.setAlignment(Qt.AlignCenter)
+            lbl.setStyleSheet(f'color: {color}; font-weight: bold; padding: 2px;')
+            visor = VisorImagen()
+            visor.setMinimumSize(280, 280)
+            visor.establecer_imagen(img)
+            col.addWidget(lbl)
+            col.addWidget(visor)
+            fila.addLayout(col)
+        layout.addLayout(fila)
+
+        btn_cerrar = QPushButton('Cerrar')
+        btn_cerrar.setMinimumHeight(32)
+        btn_cerrar.clicked.connect(dialogo.accept)
+        layout.addWidget(btn_cerrar)
+
+        dialogo.exec()
 
     # comparacion de 3 modelos
 
@@ -965,55 +1158,81 @@ class VentanaPrincipal(QMainWindow):
         info = self._tile_desde_viewport()
         if info is None:
             return
-
         tile, tx, ty, tw, th = info
-        params     = self.panel_params.obtener_params()
-        img_completa = self._imagen_orig.copy()
+        params = self.panel_params.obtener_params()
 
         def _tarea():
-            problema = construir_problema(tile, params['factor'])
-            bic      = interpolacion_bicubica(tile, params['factor'])
-            res_lap  = resolver(problema, omega=params['omega'],
-                                tol=params['tol'], max_iter=params['max_iter'],
-                                ecuacion='laplace')
-            res_poi  = resolver(problema, omega=params['omega'],
-                                tol=params['tol'], max_iter=params['max_iter'],
-                                ecuacion='poisson')
-            tabla = tabla_comparativa(tile, bic,
-                                       res_lap['imagen_recon'],
-                                       res_poi['imagen_recon'])
-            # reconstruccion completa con el mejor metodo (poisson)
-            img_recon = img_completa.copy()
-            img_recon[ty:ty+th, tx:tx+tw] = res_poi['imagen_recon']
+            factor = params['factor']
+
+            # vista a mostrar: misma ampliacion real que "Reconstruir"
+            # (modelo screened completo, con USM + anti-ringing)
+            disp = self._upscale_display(tile, factor, params)
+            res_poi = disp['res']
+
+            # tabla psnr/ssim/gmsd: metodologia degradar/factor -> reconstruir
+            # con el modelo screened, sin realce (beta=1, "suave") y con el
+            # realce configurado (beta del usuario), medidas contra el tile
+            th_lr = max(2, th // factor)
+            tw_lr = max(2, tw // factor)
+            pil_tile = Image.fromarray(
+                (np.clip(tile, 0.0, 1.0) * 255).astype(np.uint8), mode='L')
+            pil_lr = pil_tile.resize((tw_lr, th_lr), Image.LANCZOS)
+            lr = np.array(pil_lr, dtype=np.float64) / 255.0
+
+            bic = interpolacion_bicubica(tile, factor)
+
+            res_suave = upscale_poisson_screened(
+                lr, factor, lam=params['lam'], beta=1.0, tau=params['tau'],
+                usar_back_projection=params['back_projection'],
+                usar_anti_ringing=params['anti_ringing'],
+                usar_multiescala=params['multiescala'],
+                tol=params['tol'], max_iter=params['max_iter'])
+            res_realce = upscale_poisson_screened(
+                lr, factor, lam=params['lam'], beta=params['beta'], tau=params['tau'],
+                usar_back_projection=params['back_projection'],
+                usar_anti_ringing=params['anti_ringing'],
+                usar_multiescala=params['multiescala'],
+                tol=params['tol'], max_iter=params['max_iter'])
+
+            def _a_tamano_tile(arr):
+                pil = Image.fromarray(
+                    (np.clip(arr, 0.0, 1.0) * 255).astype(np.uint8), mode='L')
+                pil = pil.resize((tw, th), Image.LANCZOS)
+                return np.array(pil, dtype=np.float64) / 255.0
+
+            suave  = _a_tamano_tile(res_suave['imagen_recon'])
+            realce = _a_tamano_tile(res_realce['imagen_recon'])
+
+            tabla = tabla_comparativa(tile, bic, suave, realce)
+
             return {
-                'imagen_completa': img_recon,
+                'imagen_completa': disp['display'],
+                'imagen_upscale':  disp['display'],
                 'original': tile,
                 'bicubica': bic,
-                'laplace':  res_lap['imagen_recon'],
-                'poisson':  res_poi['imagen_recon'],
-                'tabla':    tabla,
-                'res_poi':  res_poi,
-                'region':   (tx, ty, tw, th),
+                'laplace': suave,
+                'poisson': realce,
+                'tabla': tabla,
+                'res_poi': res_poi,
+                'region': (tx, ty, tw, th),
             }
 
         ok = self._iniciar_hilo(_tarea)
         if not ok:
             return
-
-        self.statusBar().showMessage('Comparando 3 modelos...')
+        self.statusBar().showMessage('Comparando 3 modelos (screened)...')
         self._hilo.terminado.connect(self._mostrar_comparacion)
 
     def _mostrar_comparacion(self, datos: dict):
         self._resultado = datos
 
+        # ampliacion real (igual que Reconstruir), sin embed ni copia de zoom
         self.visor_recon.establecer_imagen(datos['imagen_completa'])
-        self.visor_recon.copiar_estado_zoom(self.visor_orig)
 
         self.panel_res.mostrar_comparacion(
             datos['original'], datos['bicubica'],
             datos['laplace'],  datos['poisson'],
-            datos['tabla'])
-        self.panel_res.mostrar_metricas(datos['tabla'], datos['res_poi'])
+            datos['tabla'], res_poi=datos['res_poi'])
         self.panel_res.mostrar_convergencia(
             datos['res_poi']['historial'], datos['res_poi']['omega'])
 

@@ -62,6 +62,21 @@ La version original del proyecto tenia varios problemas respecto a la especifica
 
 La correccion mas importante fue el cambio de cuatro metodos a un unico metodo SOR, y la adicion del termino de Poisson junto con la aceleracion Numba.
 
+### 2.1 Diagnostico del modelo de upscaling "Laplace armonico"
+
+Una vez resuelto lo anterior, el modo "Reconstruir" (upscaling real, seccion 5) seguia teniendo seis problemas de fondo, identificados en el documento "Analisis Critico y Mejora del Proyecto RZI":
+
+| # | Problema | Causa | Solucion adoptada |
+|---|----------|-------|--------------------|
+| 1 | Patron de "puntitos" (dimples) | Los pixeles conocidos se fijaban con condicion de Dirichlet DURA (`mascara`), creando micro-discontinuidades cada `factor` posiciones | Reemplazar `mascara` por `lam_map`: anclaje SUAVE con un termino de fidelidad `lambda*(u-f)` |
+| 2 | Sin control de nitidez real | Con `b=0` (Laplace) la solucion es la mas suave posible: nunca puede ser mas nitida que el dato de entrada | Termino de Poisson "screened" con amplificacion adaptativa de gradientes (`beta>1`) |
+| 3 | USM amplificaba el patron de puntitos | El realce se aplicaba sobre una malla con discontinuidades duras | Al eliminar las discontinuidades (punto 1), el realce ya ocurre dentro de la propia PDE |
+| 4 | `omega_opt` no consideraba el termino de fidelidad | La formula de Young asume diagonal `4` (Laplace puro); con `lam_map` la diagonal efectiva es `4+lambda` | Nueva formula `omega_opt_screened` (seccion 7.3) |
+| 5 | Criterio de parada con piso de precision | El residuo absoluto L2 no es comparable entre problemas de distinto tamano/escala | Residuo relativo `||r||/||b|| < tol` (seccion 6.4) |
+| 6 | Una sola resolucion directa al factor final | Para factores grandes, mas iteraciones y mas riesgo de minimos locales en la amplificacion | Cascada multiescala coarse-to-fine (seccion 5.2) |
+
+Estos seis puntos se resuelven con el modelo "Poisson screened" descrito en la seccion 4.4 y el pipeline de la seccion 5.2. El modelo Laplace armonico (secciones 4.1, 6.1-6.3) no se elimino: sigue siendo la base del Enfoque B (`construir_problema`, boton "Comparar 3 modelos") porque ahi su comportamiento ya esta validado y documentado (secciones 7.2, 9).
+
 ---
 
 ## 3. Arquitectura del proyecto
@@ -150,6 +165,72 @@ Para una imagen de 256 x 256 pixeles, la matriz del sistema lineal A tendria 655
 
 La solucion es el enfoque **Matrix-Free**: nunca se construye la matriz A. El estencil de 5 puntos se aplica directamente sobre la cuadricula 2D de pixeles en cada iteracion. En lugar de multiplicar A * u, se calcula `4*u[i,j] - u[i-1,j] - u[i+1,j] - u[i,j-1] - u[i,j+1]` directamente. Esto usa O(1) memoria adicional, independientemente del tamano de la imagen.
 
+### 4.4 Modelo Poisson "screened" con amplificacion adaptativa de gradientes
+
+Este es el modelo que usa el modo "Reconstruir" desde esta version (seccion 5.2). Combina dos ideas: anclaje suave a las muestras conocidas (en vez de fijarlas como condicion de borde dura) y un termino fuente que amplifica selectivamente los gradientes de borde para ganar nitidez real.
+
+**La PDE "screened" (apantallada)**:
+
+```
+lambda * chi_Omega(u - f) - Laplaciano(u) = -div(v')
+
+chi_Omega = 1 en las posiciones de muestra conocidas (cada `factor` pixeles), 0 en el resto
+f         = valor conocido en esas posiciones
+v'        = campo de gradientes amplificado (ver mas abajo)
+```
+
+En forma de energia, esto equivale a minimizar:
+
+```
+E(u) = lambda * suma_Omega (u - f)^2 + suma (gradiente(u) - v')^2
+```
+
+El primer termino penaliza alejarse de los datos conocidos (sin obligar, a diferencia de Dirichlet); el segundo penaliza que el gradiente de la solucion se aleje del campo de gradientes deseado `v'`.
+
+**Por que esto sharpens (justificacion en el dominio de Fourier)**: para el caso continuo con `chi_Omega=1` en todas partes y `v'=beta*gradiente(f)`, la solucion en frecuencia es
+
+```
+u_hat(w) = (lambda + beta*w^2) / (lambda + w^2) * f_hat(w)
+```
+
+Para `beta > 1`, el factor `(lambda + beta*w^2)/(lambda + w^2)` crece con `w` (frecuencia espacial) y tiende a `beta` cuando `w` es grande: las altas frecuencias (bordes, detalle fino) se amplifican con una ganancia acotada por `beta`, mientras que `lambda` ancla el nivel de continua (DC) y evita que la solucion "flote" sin referencia. Esto es exactamente un realce de nitidez controlado, derivado de la PDE en lugar de un filtro post-proceso.
+
+**Amplificacion adaptativa de gradientes** (`amplified_guidance` en `core/poisson_builder.py`):
+
+```
+v' = s(||v||) * v
+s(t) = 1 + (beta - 1) * t / (t + tau)
+```
+
+donde `v = gradiente(G)` (G = guia bicubica) y `t = ||v||` es la magnitud local del gradiente.
+
+- Para gradientes grandes (`t >> tau`, bordes reales): `s(t) -> beta`. Se amplifica el contraste del borde.
+- Para gradientes pequenos (`t << tau`, zonas planas o ruido): `s(t) -> 1`. No se amplifica nada.
+
+Asi, el realce se concentra en los bordes reales y no en el ruido, a diferencia de un USM global.
+
+**Vector b y `lam_map`** (`construir_problema_screened`):
+
+```python
+# fragmento de core/poisson_builder.py
+lam_map = np.zeros((new_h, new_w))
+lam_map[::factor, ::factor] = lam          # solo en las muestras conocidas
+
+gx, gy = amplified_guidance(G, beta=beta, tau=tau)
+b = -divergence(gx, gy)
+b[::factor, ::factor] += lam * tile        # termino de fidelidad lambda*f
+```
+
+La ecuacion resuelta en cada pixel es entonces:
+
+```
+(4 + lam_map[i,j]) * u[i,j] - (suma de los 4 vecinos) = b[i,j]
+```
+
+Donde `lam_map[i,j] = 0` (pixeles intermedios), esto es la PDE de Poisson normal con la fuente amplificada. Donde `lam_map[i,j] = lambda` (muestras conocidas), el termino `lambda*u` agrega una penalizacion que ancla `u[i,j]` cerca de `f` sin fijarlo de forma rigida: el valor final puede diferir levemente de `f` si los vecinos "tiran" en otra direccion, lo cual elimina las discontinuidades duras que causaban el patron de puntitos (problema 1 de la seccion 2.1).
+
+`divergence()` y `amplified_guidance()` usan convenciones de diferencias consistentes (adelante para el gradiente, atras para la divergencia), de modo que `divergence(gradiente(G))` reproduce exactamente el laplaciano de 5 puntos cuando no hay amplificacion (`beta=1`).
+
 ---
 
 ## 5. Dos modos de uso: Reconstruir y Comparar
@@ -160,80 +241,98 @@ La aplicacion tiene dos modos de operacion bien diferenciados. Entender la difer
 
 | Boton | Que hace | Para que sirve |
 |-------|----------|----------------|
-| Reconstruir (Poisson SOR) | Toma la region visible como imagen de entrada y la agranda factor veces | Ver el resultado del upscaling: la region se ve mas suave y con bordes definidos |
-| Comparar 3 modelos | Degrada la imagen a proposito (Enfoque B) y la reconstruye para medir PSNR/SSIM | Validacion academica: medir la calidad numerica contra la verdad de campo |
+| Reconstruir (Poisson SOR) | Toma la region visible y la agranda factor veces con el modelo Poisson "screened" (seccion 4.4), opcionalmente en cascada multiescala. El visor derecho muestra la AMPLIACION REAL (mismo tamaño que el dialogo de detalle, no una version reducida). Ademas abre un dialogo con la comparacion en detalle a resolucion ampliada | Ver la region ampliada y nitida, y en el dialogo la diferencia entre zoom nativo, bicubica y Poisson SOR screened |
+| Comparar 3 modelos | Degrada la region por `factor` (LANCZOS), la reconstruye con el modelo screened sin realce (beta=1) y con realce (beta del usuario), y mide PSNR, SSIM y GMSD de cada uno contra la region original. El visor derecho muestra la misma ampliacion real que "Reconstruir" | Validacion numerica: comparar bicubica vs Poisson screened sin/con amplificacion de gradientes |
 
-### 5.2 El modo "Reconstruir": upscaling real
+### 5.2 El modo "Reconstruir": upscaling real con Poisson screened
 
-Cuando el usuario hace zoom en una region y pulsa "Reconstruir", ocurre lo siguiente:
+Cuando el usuario hace zoom en una region y pulsa "Reconstruir", ocurre lo siguiente (`core/upscaler.py`, funcion `upscale_poisson_screened`):
 
 1. Se extrae la region visible del visor izquierdo como un tile (un recorte de pixeles).
 2. Ese tile se trata como la imagen de baja resolucion: es la informacion que ya se tiene.
-3. Se crea una malla nueva, factor veces mas grande por lado.
-4. Los pixeles del tile ocupan posiciones exactas en esa malla grande: `tile[i,j]` cae en `malla[i*factor, j*factor]`.
-5. Los huecos entre ellos son los pixeles nuevos a calcular.
-6. La PDE de Poisson rellena esos huecos de forma matematicamente suave y coherente con los bordes del tile.
-7. El visor derecho muestra la region agrandada y suave.
+3. El factor de ampliacion se descompone en una **cascada coarse-to-fine** (multiescala):
+   - Factores potencia de 2 (2, 4, 8): cascada completa de etapas x2.
+   - Factor 6: una etapa x2 seguida de una etapa x3.
+   - Factores sin esa descomposicion (3, 5, 7) o con "Multiescala" desactivado: una unica etapa al factor pedido.
+4. En cada etapa se construye el problema "screened" (`construir_problema_screened`, seccion 4.4) usando como entrada el resultado de la etapa anterior, y se resuelve con `resolver_screened` (SOR Red-Black paralelo, seccion 6.4).
+5. Tras la cascada, se aplican (si estan activados) **back-projection** y **anti-ringing** del pipeline.
+6. Para mostrarlo, se lleva el resultado al tamaño exacto `tw*factor x th*factor`, se aplica el Unsharp Mask opcional (USM) y, AL FINAL, un segundo paso de **anti-ringing** contra una guia bicubica de ese mismo tamaño (recorta el overshoot que pueda introducir el USM, sin deshacer el realce de `beta`). Esa imagen ampliada es la que se muestra tanto en el visor derecho como en el dialogo de detalle: ambos muestran exactamente la misma reconstruccion.
 
 ```
-tile 64x64  (factor=4)  ->  malla 253x253
+tile 64x64  (factor=4)  ->  cascada [2, 2]  ->  127x127  ->  253x253
 
-  tile[0,0]      tile[0,1]      ...
-     |   (huecos)   |
-  malla[0,0] ... malla[0,4] ... malla[0,8]
-  (conocido)      (nuevo)        (conocido)
+Cada etapa: malla alineada por esquinas
+new_h = (h - 1) * factor_etapa + 1
+new_w = (w - 1) * factor_etapa + 1
 ```
 
-La formula de la malla alineada por esquinas garantiza que no haya borde colgante:
+**Por que cascada en vez de resolver directo al factor final**: cada etapa parte de un "warm start" que ya es una buena aproximacion (resultado de la etapa anterior, que a su vez ya tiene los bordes amplificados). Esto reduce el numero total de iteraciones de SOR y evita que la amplificacion de gradientes (`beta`) se aplique de una sola vez sobre saltos de resolucion muy grandes.
+
+**Back-projection** (`back_projection` en `core/upscaler.py`): refuerza que reducir el resultado vuelva a dar el tile original.
 
 ```
-new_h = (h - 1) * factor + 1
-new_w = (w - 1) * factor + 1
-
-Ejemplo: tile 64x64, factor=4  ->  new_h = 63*4+1 = 253, new_w = 253
+Down(u)   = reducir u al tamano del tile (Image.BOX, promedio de area)
+residuo   = tile - Down(u)
+Up(resid) = agrandar el residuo al tamano de u (Image.BICUBIC)
+u <- u + gain * Up(residuo)         # gain=0.8, 2 pasadas
 ```
 
-**Por que se usa Laplace (b=0) en lugar de Poisson con b=Lap(bicubica)**:
+Esto corrige el sesgo de baja frecuencia que puede introducir la amplificacion de gradientes, sin deshacer el realce de bordes (el residuo es de baja frecuencia, las altas frecuencias de `u` quedan intactas).
 
-Cuando b = Laplaciano(bicubica), el solver converge hacia la bicubica: la solucion esta sesgada y resulta igualmente borrosa. Con b=0, el solver converge hacia la interpolacion armonica (membrana minima), que:
-- No tiene el "ringing" (halos) tipico de la bicubica cerca de los bordes.
-- Preserva los gradientes de los pixeles conocidos de forma natural.
-- Se ve mas nitida en bordes fuertes como los de un equipo o una silueta.
+**Anti-ringing** (`anti_ringing` en `core/upscaler.py`): recorta el resultado al rango `[minimo, maximo]` local 3x3 de la guia bicubica de referencia (`scipy.ndimage.minimum_filter`/`maximum_filter`). Esto evita que la amplificacion de gradientes genere sobre-realces ("halos") cerca de bordes muy fuertes.
 
-**Punto de partida inteligente**: el solver parte de la bicubica como estimacion inicial (no de cero). Esto da dos ventajas:
-- La bicubica ya es una buena aproximacion: el residuo inicial es pequeno.
-- El solver converge mas rapido (menos iteraciones).
-- El resultado final ES LA SOLUCION ARMONICA (no la bicubica), solo que se llega a ella mas rapido.
+**Parametros de "Nitidez Adaptativa (Screened Poisson)"**:
 
-**Como se muestra el resultado (visor derecho)**:
+| Parametro | Rango | Efecto |
+|-----------|-------|--------|
+| Lambda (fidelidad) | 0.5 - 50 | Peso del anclaje suave a las muestras conocidas. Mayor = mas fiel a la guia bicubica en esas posiciones; menor = la PDE tiene mas libertad |
+| Beta (amplificacion) | 1.0 - 3.0 | Ganancia maxima sobre gradientes de bordes reales. 1 = sin amplificacion (equivale al modelo Laplace) |
+| Tau (umbral) | 0.001 - 0.2 | Magnitud de gradiente bajo la cual NO se amplifica (evita realzar ruido) |
+| Multiescala | on/off | Activa la cascada coarse-to-fine descrita arriba |
+| Back-projection | on/off | Activa la correccion de consistencia Down(u) ~= tile |
+| Anti-ringing | on/off | Activa el recorte a limites locales de la bicubica |
 
-1. La malla ampliada (SOR) se ajusta al tamano exacto `th*factor x tw*factor` con LANCZOS para embedding limpio.
-2. Se aplica Unsharp Mask (USM) sobre la malla ampliada (NO sobre el tile reducido). El radio se escala por factor (`radius = 2*factor`) para que el efecto perceptual sea equivalente: realza los bordes a la resolucion upscalada, visible al mostrar la imagen a su tamano natural.
-3. Se extrae del original una region con padding alrededor del tile (aprox. un tercio de cada lado), se upscala con PIL BICUBIC y se incrusta el resultado SOR en el centro. Esto da contexto visual sin cortar la imagen.
-4. El visor derecho muestra ese composite upscalado con ajuste automatico (fit-to-window). Cuando el zoom del visor izquierdo es suficientemente alto (pixel blocks visibles), el visor derecho a fit-to-window muestra la misma area de escena pero con la reconstruccion SOR en lugar de bloques pixelados.
+El parametro "Nitidez (USM %)" se mantiene como un realce adicional opcional, ahora con un valor por defecto bajo (60%, antes 150%): con `beta>1` la PDE ya hace la mayor parte del realce, y un USM fuerte sumado a `beta` producia un sobre-realce visible como un halo blanco en los bordes. El anti-ringing aplicado DESPUES del USM (ver punto 6 arriba) recorta ese halo si el usuario sube la fuerza del USM.
 
-**Por que la diferencia es ahora visible de forma objetiva**:
+**Como se muestra el resultado**:
 
-A zoom alto (factor >= 3x display), el visor izquierdo muestra el tile original con transiciones en escalon entre pixeles (bloques). El visor derecho muestra la malla SOR ampliada: las transiciones son gradientes suaves calculados por la funcion armonica. La comparacion directa es:
+El flujo "Reconstruir" produce UNA sola imagen, mostrada en dos lugares:
 
-```
-Izquierdo: [100] [100] [200] [200]  <- pixel blocks (escalon abrupto)
-Derecho:   [100] [133] [166] [200]  <- gradiente armonico (transicion suave)
-```
+1. **Visor derecho**: muestra la AMPLIACION REAL de la region (`tw*factor x th*factor`), con `fitInView` ajustando la vista a la ventana. El visor izquierdo sigue mostrando la region original en su zoom actual (zoom nativo, pixelado); el derecho muestra la version ampliada y suavizada del modelo screened. No hay reduccion ni embed: lo que se ve a la derecha es el resultado completo de la PDE.
 
-La USM con radio escalado amplifica adicionalmente el contraste en los bordes del resultado SOR, haciendo la diferencia perceptualmente mas evidente.
+2. **Dialogo de comparacion en detalle (se abre automaticamente)**: muestra LADO A LADO, a esa misma resolucion ampliada, tres versiones de la region:
+   - Zoom nativo (vecino mas proximo): los bloques pixelados que se verian con el zoom normal de cualquier visor.
+   - Bicubica (PIL BICUBIC): suavizado estandar.
+   - Poisson SOR screened: anclaje suave + amplificacion adaptativa de gradientes + USM + anti-ringing final.
 
-**El parametro "Nitidez (USM %)"**: controla la intensidad del realce. 0 = sin USM (interpolacion armonica pura), 150 = predeterminado, 300 = maximo. A mayor porcentaje, los bordes se ven mas nitidos pero pueden aparecer halos si se excede.
+   La columna "Poisson SOR screened" del dialogo es EXACTAMENTE la misma imagen que se ve en el visor derecho (antes eran dos imagenes distintas, una limpia en el dialogo y otra con halo en el panel, por aplicar el USM dos veces sobre versiones de distinto tamaño).
 
-**Nota honesta**: el upscaling no inventa detalle que no existia. El objetivo es eliminar la apariencia pixelada del zoom y producir una interpolacion matematicamente optima (la mas suave posible entre los puntos conocidos). La comparacion justa no es contra la imagen original a zoom 1:1, sino contra el zoom pixelado (vecino mas proximo) que cualquier visor mostraria por defecto.
+   Aqui es evidente la diferencia: el zoom nativo muestra escalones (bloques), la bicubica los suaviza con cierto efecto "plastificado", y el SOR screened produce transiciones suaves con bordes mas marcados, sin el patron de puntitos del modelo anterior (porque ya no hay condiciones de Dirichlet duras, ver seccion 2.1 punto 1).
 
-### 5.3 Por que antes se veia peor (historial de correcciones)
+**Nota honesta**: el upscaling no inventa detalle que no existia. La amplificacion de gradientes (`beta`) realza el contraste de bordes que YA estan presentes en la guia bicubica; no agrega texturas ni informacion nueva. El objetivo es producir una interpolacion mas nitida y con menos artefactos que un re-muestreo simple, controlable mediante `lambda`, `beta` y `tau`.
 
-En la version original, "Reconstruir" usaba el Enfoque B: degradaba la region visible (tiraba 15 de cada 16 pixeles) y luego intentaba recuperarla. Este flujo es correcto para medir la calidad de la reconstruccion, pero por construccion nunca puede producir una imagen mejor que la original.
+### 5.3 Historial de correcciones de este flujo
 
-Una segunda version aplicaba el upscaling real (Laplace armonico), pero luego reducia el resultado de vuelta al tamano original con LANCZOS y lo reembebia en la imagen completa mostrando ambos visores al mismo zoom. El problema: el round-trip produce un resultado casi identico al original cuando se ve a la misma escala de pantalla, porque Qt interpola ambas imagenes de la misma manera.
+1. **Version original**: "Reconstruir" usaba el Enfoque B (degradar la region tirando 15/16 pixeles y reconstruir). Correcto para medir calidad con PSNR/SSIM, pero por construccion nunca puede verse mejor que el original.
 
-El flujo actual muestra el resultado a la resolucion upscalada (NO reducido), con contexto lateral para evitar el efecto de corte. La diferencia es visible porque las transiciones entre pixeles son suaves en el visor derecho (gradiente armonico) y en escalon en el izquierdo (pixel block del zoom nativo).
+2. **Segunda version**: upscaling real (Laplace armonico) + embed-back con USM moderado (125-150%). Problema: a la misma escala de pantalla, el resultado embebido es casi identico al original ("se ven casi iguales"), porque el round-trip upscale-downscale con datos ya completos produce un resultado muy cercano al original.
+
+3. **Tercera version**: mostrar el composite upscalado x factor con contexto bicubico alrededor, en vez de embeber. La diferencia se volvia evidente, pero el visor derecho mostraba menos area que el izquierdo: seguia "cortando" en el sentido de no mostrar la imagen completa.
+
+4. **Cuarta version**: combina lo mejor de las dos ultimas. El visor derecho hace embed-back (imagen completa, mismo zoom, mejora sutil pero real, ~24% mas nitido). Ademas se abre un dialogo de detalle con la comparacion dramatica (zoom nativo vs bicubica vs SOR a resolucion ampliada), que es donde la ventaja del metodo PDE se aprecia con claridad. Modelo: Laplace armonico (b=0) con condicion de Dirichlet dura en las muestras conocidas.
+
+5. **Quinta version (Poisson screened)**: se reemplaza el modelo Laplace armonico por el modelo "screened" con amplificacion adaptativa de gradientes (seccion 4.4). Las muestras conocidas dejan de fijarse con Dirichlet duro y pasan a anclarse con un termino de fidelidad suave `lam_map`, lo que elimina el patron de puntitos en su origen (ya no hace falta el Gaussian blur previo de la version anterior). Se agregan: cascada multiescala coarse-to-fine, back-projection y anti-ringing. Los parametros `lambda`, `beta` y `tau` quedan expuestos en la interfaz para controlar el balance entre fidelidad a los datos y nitidez.
+
+6. **Version actual (resultado unico, sin halo, Comparar tambien screened)**: se detectaron dos inconsistencias en la version anterior:
+   - El panel "Reconstruida" mostraba una imagen DISTINTA a la del dialogo de detalle (la del panel se reducia al tamaño del tile, se re-aplicaba USM y se incrustaba en la imagen completa; ese ciclo reducir-reenfocar-ampliar-en-pantalla concentraba un halo blanco en los bordes, sumado al realce que ya hacia `beta`).
+   - "Comparar 3 modelos" seguia usando el Enfoque B antiguo (kernel con mascara Dirichlet dura, `omega` clasico ~1.95), por lo que mostraba el patron de puntitos y una convergencia oscilante en el MISMO panel y grafica que usa "Reconstruir", dando la impresion de que el resultado "cambiaba" segun el boton.
+
+   Correcciones aplicadas:
+   - Nuevo metodo compartido `_upscale_display` (en `ui/main_window.py`) que produce la imagen ampliada final: `upscale_poisson_screened` -> tamaño exacto `tw*factor x th*factor` -> USM opcional -> **anti-ringing al final** contra una guia bicubica del mismo tamaño (recorta el overshoot del USM). Tanto "Reconstruir" como "Comparar" usan este metodo, y el panel "Reconstruida" ahora muestra exactamente la misma imagen que el dialogo de detalle (sin embed, sin reduccion, sin `copiar_estado_zoom`).
+   - El valor por defecto de "Nitidez (USM %)" baja de 150 a 60, para no duplicar el realce que ya aporta `beta`.
+   - "Comparar 3 modelos" pasa a usar el modelo screened en los tres metodos de la tabla: Bicubica, Screened sin realce (`beta=1`) y Screened con realce (`beta` del usuario), todos medidos contra la region degradada por `factor` y vueltos a comparar contra la region original (PSNR/SSIM/GMSD). La grafica de convergencia y el panel "Reconstruida" usan el resultado screened (omega ~1.03, monotono), no el kernel viejo.
+
+7. **Correccion del crash de broadcast en regiones grandes**: al probar la version anterior con una region grande (por ejemplo 229x416 px a factor 4) "Reconstruir" lanzaba el error `operands could not be broadcast together with shapes (1199,659) (1661,913) (1661,913)`. Causa: `construir_problema_screened` tiene un tope de memoria (`MAX_PIXELS=1.2M`, `MAX_LADO=1200`) que reduce el tile cuando la malla alineada por esquinas seria muy grande, de modo que la salida real `u` de la cascada queda mas pequeña que la malla nominal `(h-1)*factor+1`. El anti-ringing interno de `upscale_poisson_screened` construia su guia bicubica `ref` con el tamaño nominal (1661x913) mientras que `u` ya venia recortado por el tope (1199x659), y el recorte de `anti_ringing` fallaba por formas incompatibles. Correccion (en `core/upscaler.py`): construir `ref` con el tamaño REAL de `u` (`new_h, new_w = u.shape`) en vez del nominal. Cuando el tope no actua el resultado no cambia (`u.shape` coincide con la malla nominal). Verificado headless: el caso de 229x416 a factor 4 ya no crashea (devuelve 1199x659, mismo aspecto) y el caso chico de 64x64 a factor 4 sigue dando la malla nominal 253x253.
 
 ### 5.4 Comparacion visual del upscaling
 
@@ -244,6 +343,8 @@ La siguiente figura muestra la diferencia entre los tres metodos de ampliacion p
 - **Vecino mas proximo (zoom nativo)**: bloques pixelados visibles, el estilo tipico del zoom de cualquier visor de imagenes.
 - **Bicubica (PIL BICUBIC)**: suave pero con un ligero efecto de "plastificado", pierde algo de contraste local.
 - **Poisson SOR (upscaling PDE)**: suave como la bicubica pero con bordes mas definidos en las transiciones abruptas (ver esquina inferior derecha de la figura), gracias al termino de Poisson que guia la solucion hacia los gradientes del tile.
+
+Esta misma comparacion (zoom nativo / bicubica / Poisson SOR) se genera ahora dentro de la aplicacion, para la region elegida por el usuario, en el dialogo de "Comparacion en detalle" descrito en 5.2.
 
 ---
 
@@ -335,11 +436,52 @@ norma_L2 = sqrt( sum( residuo[i,j]^2 ) para todos los pixeles desconocidos )
 
 Si `norma_L2 < tol`, la solucion esta suficientemente cerca del equilibrio y se detiene. La tolerancia tipica usada es `1e-5`.
 
+**Limite de la tolerancia en la interfaz**: el spinbox "Tolerancia" permite valores entre `1e-7` y `1e-2` (antes el minimo era `1e-10`). Para mallas grandes, `norma_L2` es la suma de cuadrados de residuos sobre decenas de miles de pixeles, asi que su piso practico (limitado por la precision de `float64`) ronda `1e-9` a `1e-12`. Con `tol=1e-10`, el solver visualmente ya convergio (el residuo dejo de bajar) pero nunca cumple `norma_L2 < tol`, y agota `max_iter` (en pruebas: 7900 iteraciones, hasta 42 segundos, sin ninguna mejora visual sobre detenerse antes). Con `tol=1e-6`, el mismo problema converge en unos cientos de iteraciones (ej. 363 iter, ~0.6s) con resultado visualmente identico.
+
 La siguiente grafica muestra como cae el residuo con cada iteracion para la imagen de camara 128x128 con factor=4:
 
 ![Convergencia del solver](assets/convergencia.png)
 
 El residuo desciende monotonamente en escala logaritmica, confirmando la convergencia correcta del solver.
+
+### 6.4 Kernel "screened" paralelo y residuo relativo
+
+El modelo de la seccion 4.4 usa un segundo kernel, `_kernel_sor_rb_screened` en `core/sor_solver.py`, con dos diferencias respecto a `_kernel_sor_rb`:
+
+**Diagonal `4 + lam_map[i,j]`**: en vez de dividir por 4, cada actualizacion de Gauss-Seidel divide por `4 + lam_map[i,j]`:
+
+```python
+diag = 4.0 + lam_map[i, j]
+u_gs = (u[i-1,j]+u[i+1,j]+u[i,j-1]+u[i,j+1] + b[i,j]) / diag
+u[i,j] += omega * (u_gs - u[i,j])
+```
+
+Donde `lam_map=0` (pixeles intermedios) esto es identico al kernel original. Donde `lam_map=lambda` (muestras conocidas), la diagonal mas grande hace que esos pixeles "resistan" mas el cambio, ancla suave en vez de Dirichlet duro.
+
+**Paralelizacion con `prange`**: las fases Roja y Negra son seguras de paralelizar fila por fila con `numba.prange`, porque dentro de una fase cada pixel solo lee valores de la fase opuesta, ya finalizados en la iteracion anterior; no hay condiciones de carrera entre filas.
+
+```python
+@njit(cache=True, fastmath=True, parallel=True)
+def _kernel_sor_rb_screened(u, b, lam_map, omega, max_iter, tol):
+    for k in range(max_iter):
+        for i in prange(1, nrows-1):     # Fase Roja, en paralelo por fila
+            ...
+        for i in prange(1, nrows-1):     # Fase Negra, en paralelo por fila
+            ...
+        # residuo relativo
+        if norma_residuo / norma_b < tol:
+            break
+```
+
+Si Numba no esta disponible, `prange` cae a `range` normal (mismo resultado, sin paralelismo).
+
+**Residuo relativo como criterio de parada**: en vez de `||r||_2 < tol` (seccion 6.3), se usa
+
+```
+||r||_2 / ||b||_2 < tol
+```
+
+Esto es independiente de la escala del problema (tamano de malla, magnitud de `b`), por lo que un mismo `tol` (por defecto `1e-4`) tiene un significado consistente sin importar el factor de ampliacion o el tamano del tile. En la practica, el modelo screened converge en pocas decenas de iteraciones por etapa (tipicamente 20-40).
 
 ---
 
@@ -385,6 +527,23 @@ La formula se valida comparando el optimo teorico con el empirico. Para el probl
 **Panel derecho (submuestreo factor=4)**: El minimo empirico cae en `omega_empirico = 1.5149`. Esto es esperable: cuando hay restricciones de Dirichlet en pixeles interiores (los que se conocen por submuestreo), el dominio efectivo de cada "celda" entre pixeles conocidos es mucho mas pequeno que la imagen completa. Para una celda de 4x4 pixeles, la formula da `omega_opt(4x4) = 1.26`. El valor empirico (1.51) queda entre la escala local (4x4) y la global (64x64), lo cual es correcto: ambas escalas contribuyen al comportamiento espectral.
 
 La implementacion usa `omega_opt` de la formula como punto de partida. Este valor siempre produce convergencia, aunque no sea el exactamente optimo para el problema con submuestreo.
+
+### 7.3 omega_opt para el operador "screened"
+
+La formula de Young (7.1) asume una diagonal de `4` (Laplace puro). El kernel screened (seccion 6.4) tiene diagonal `4 + lambda` en las muestras conocidas, lo que cambia el radio espectral de la iteracion de Jacobi subyacente:
+
+```
+rho_J = (4 / (4 + lambda)) * cos(pi / (n + 1))
+omega_opt_screened = 2 / (1 + sqrt(1 - rho_J^2))
+
+donde n = min(nrows, ncols)
+```
+
+Cuando `lambda -> 0`, `4/(4+lambda) -> 1` y la formula se reduce exactamente a `omega_opt` de Young (con `cos(pi/(n+1))` en vez de `sin`, que es la misma cantidad para el mismo operador).
+
+Para `lambda=8` (valor por defecto) el factor `4/(4+8) = 1/3` reduce fuertemente `rho_J`, lo que da un `omega_opt_screened` mucho mas cercano a 1 que el de Young. Por ejemplo, para una malla de 77x77 con `lambda=8`: `omega_opt_screened ~ 1.03`, frente a `omega_opt ~ 1.92` de la formula clasica para el mismo tamano. Esto es consistente: una diagonal mucho mayor que 4 hace que el sistema sea mas diagonalmente dominante, y la sobrerrelajacion optima se acerca a Gauss-Seidel puro (`omega=1`).
+
+Esta es la formula que usa `construir_problema_screened` para fijar `omega_opt` en cada etapa de la cascada (seccion 5.2); el usuario puede seguir fijando `omega` manualmente desde la interfaz para el modelo Laplace/Enfoque B (seccion 7.1).
 
 ---
 
@@ -449,7 +608,11 @@ donde MSE = promedio de (original[i,j] - reconstruida[i,j])^2
 
 **SSIM (Structural Similarity Index)** mide la similitud perceptual: brillo, contraste y estructura. Toma valores entre -1 y 1, donde 1 significa imagenes identicas.
 
+**GMSD (Gradient Magnitude Similarity Deviation)**, agregada junto con el modelo screened (seccion 4.4), mide directamente la similitud de la ESTRUCTURA de bordes: se calcula el mapa de magnitud de gradiente (filtros de Prewitt) de cada imagen, su mapa de similitud puntual, y GMSD es la desviacion estandar de ese mapa. Valores mas BAJOS indican mejor calidad (0 = identicas). A diferencia de PSNR/SSIM, es especialmente sensible a la perdida de nitidez: una imagen borrosa tiene gradientes mas pequenos que el original, lo que eleva el GMSD. Se calcula en `services/metrics.py` (`gmsd`) y se muestra como columna adicional en "Comparar 3 modelos".
+
 ### 9.3 Tabla comparativa
+
+**Nota**: la tabla de esta seccion documenta el hallazgo historico sobre el Enfoque B (kernel `_kernel_sor_rb` con mascara Dirichlet, usado hoy solo por Barrido Omega, Benchmark y Animar Convergencia). El boton "Comparar 3 modelos" de la interfaz ya NO usa este Enfoque B: desde la version descrita en 5.3 punto 6, compara Bicubica vs el modelo screened sin/con amplificacion de gradientes (ver 5.1), por lo que sus columnas y valores son distintos a los de aqui.
 
 La siguiente tabla muestra los resultados sobre la imagen de camara 64x64 con factor=4:
 

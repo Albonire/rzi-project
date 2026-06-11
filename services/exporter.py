@@ -117,26 +117,33 @@ def grafica_barrido_omega(omegas: list, iteraciones: list,
 def grafica_comparacion_4modelos(original, bicubica, laplace, poisson,
                                   tabla: list, ruta: str = None) -> plt.Figure:
     """
-    Genera la figura comparativa de 4 modelos (seccion 8.2):
-      Original (Verdad de Campo) | Bicubica | Laplace Puro | Poisson SOR
-    Incluye PSNR y SSIM como subtitulo de cada panel.
+    Genera la figura comparativa de 4 modelos con aspect ratio correcto.
     """
-    fig, ejes = plt.subplots(1, 4, figsize=(16, 4))
+    h, w = original.shape[:2]
+    aspect_ratio = h / w
+
+    ancho_panel = 4
+    alto_panel = ancho_panel * aspect_ratio
+    fig, ejes = plt.subplots(1, 4, figsize=(4 * ancho_panel, alto_panel + 1))
+
     imagenes  = [original, bicubica, laplace, poisson]
     titulos   = ['Original\n(Verdad de Campo)', 'Bicubica\n(Pillow BICUBIC)',
-                 'Laplace Puro\n(modelo antiguo)', 'Poisson SOR\n(nuestro modelo)']
+                 'Screened sin realce\n(beta=1)', 'Screened con realce\n(nuestro modelo)']
 
-    for ax, img, titulo, fila in zip(ejes, imagenes, titulos,
-                                     [None] + tabla):
+    for ax, img, titulo, fila in zip(ejes, imagenes, titulos, [None] + tabla):
         ax.imshow(img, cmap='gray', vmin=0, vmax=1, interpolation='nearest')
-        ax.set_title(titulo, fontsize=10, fontweight='bold')
+        ax.set_title(titulo, fontsize=11, fontweight='bold', pad=10)
         ax.axis('off')
-        if fila:
-            ax.set_xlabel(f"PSNR={fila['psnr']:.1f} dB  SSIM={fila['ssim']:.3f}",
-                          fontsize=8)
 
-    fig.suptitle('Comparacion Visual de Metodos de Reconstruccion', fontsize=12)
-    fig.tight_layout()
+        if fila:
+            metricas_text = (f"PSNR={fila['psnr']:.1f} dB  |  SSIM={fila['ssim']:.3f}  |  "
+                              f"GMSD={fila['gmsd']:.4f}")
+            ax.set_xlabel(metricas_text, fontsize=9, color='#2196F3', fontweight='bold')
+
+    fig.suptitle('Comparacion Visual de Metodos de Reconstruccion',
+                 fontsize=13, fontweight='bold', y=1.02)
+    fig.tight_layout(rect=[0, 0, 1, 0.95])
+
     if ruta:
         fig.savefig(ruta, dpi=150, bbox_inches='tight')
         plt.close(fig)
