@@ -16,7 +16,7 @@ flujo de "comparar 3 modelos" (enfoque b, para metricas psnr/ssim):
 
 import os
 import numpy as np
-from PIL import Image, ImageFilter
+from PIL import Image
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
@@ -35,13 +35,13 @@ from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 
 from ui.zoom_viewer import VisorImagen
-from core.poisson_builder import (construir_problema, construir_problema_upscale,
-                                   construir_problema_screened,
+from core.poisson_builder import (construir_problema, construir_problema_screened,
                                    imagen_a_grises, calcular_omega_optimo)
 from core.sor_solver import (resolver, resolver_screened, barrido_omega as _barrido,
                               benchmark_numba_vs_python, NUMBA_DISPONIBLE,
-                              _calentamiento, resolver_con_snapshots)
-from core.upscaler import upscale_poisson_screened, anti_ringing
+                              _calentamiento)
+from core.upscaler import upscale_poisson_screened, finalizar_display, finalizar_display_color
+from core.image_ops import rgb_a_ycbcr, ycbcr_a_rgb, resize_float, resize_rgb_float
 from services.metrics import (psnr, ssim, interpolacion_bicubica, tabla_comparativa)
 from services.exporter import (guardar_imagen, exportar_csv,
                                 grafica_convergencia, grafica_barrido_omega,
@@ -328,6 +328,22 @@ class PanelParametros(QWidget):
             'recorta el resultado a los limites locales de la guia bicubica')
         scl.addWidget(self.chk_anti_ringing, 5, 1)
 
+        scl.addWidget(QLabel('Filtro shock:'), 6, 0)
+        self.chk_shock = QCheckBox()
+        self.chk_shock.setChecked(True)
+        self.chk_shock.setToolTip(
+            'filtro de shock (Osher-Rudin): convierte rampas borrosas en '
+            'bordes nitidos, sin afectar zonas planas')
+        scl.addWidget(self.chk_shock, 6, 1)
+
+        scl.addWidget(QLabel('Difusion (denoise):'), 7, 0)
+        self.chk_difusion = QCheckBox()
+        self.chk_difusion.setChecked(True)
+        self.chk_difusion.setToolTip(
+            'difusion anisotropica (Perona-Malik): limpia ruido de grano en '
+            'zonas planas preservando los bordes')
+        scl.addWidget(self.chk_difusion, 7, 1)
+
         lay.addWidget(g_screened)
 
 
@@ -388,6 +404,8 @@ class PanelParametros(QWidget):
             'multiescala':      self.chk_multiescala.isChecked(),
             'back_projection':  self.chk_back_projection.isChecked(),
             'anti_ringing':     self.chk_anti_ringing.isChecked(),
+            'usar_shock':       self.chk_shock.isChecked(),
+            'usar_difusion':    self.chk_difusion.isChecked(),
         }
 
     def deshabilitar(self, flag: bool):
@@ -605,7 +623,8 @@ class PanelResultados(QWidget):
 class VentanaPrincipal(QMainWindow):
     def __init__(self):
         super().__init__()
-        self._imagen_orig = None   # ndarray float64 [0,1] grises, imagen completa
+        self._imagen_orig  = None  # ndarray float64 [0,1] grises (luminancia), imagen completa
+        self._imagen_color = None  # ndarray float64 [0,1] RGB (h,w,3), o None si la imagen es gris
         self._hilo        = None
         self._resultado   = None   # ultimo resultado para exportacion
         self._modo_lupa_activo = False
@@ -653,7 +672,7 @@ class VentanaPrincipal(QMainWindow):
 
         # visor izquierdo: imagen original
         col_orig = QVBoxLayout()
-        lbl_orig = QLabel('Original  (zoom con rueda y arrastre)')
+        lbl_orig = QLabel('Original')
         lbl_orig.setStyleSheet('color: #2196F3; font-weight: bold; padding: 2px;')
         lbl_orig.setAlignment(Qt.AlignCenter)
         self.visor_orig = VisorImagen()
@@ -662,7 +681,7 @@ class VentanaPrincipal(QMainWindow):
 
         # visor derecho: imagen reconstruida / agrandada
         col_recon = QVBoxLayout()
-        lbl_recon = QLabel('Reconstruida  (imagen completa, mismo zoom - realce SOR)')
+        lbl_recon = QLabel('Reconstruida')
         lbl_recon.setStyleSheet('color: #4CAF50; font-weight: bold; padding: 2px;')
         lbl_recon.setAlignment(Qt.AlignCenter)
         self.visor_recon = VisorImagen()
@@ -745,14 +764,26 @@ class VentanaPrincipal(QMainWindow):
         if not ruta:
             return
         try:
-            pil_img = Image.open(ruta).convert('RGB')
+            pil_original = Image.open(ruta)
+            es_color = pil_original.mode not in ('L', '1', 'I', 'F')
+
+            pil_img = pil_original.convert('RGB')
             arr = np.asarray(pil_img, dtype=np.float64) / 255.0
-            self._imagen_orig = imagen_a_grises(arr)
-            self._resultado   = None
-            self.visor_orig.establecer_imagen(self._imagen_orig)
+
+            if es_color:
+                self._imagen_color = arr
+                self._imagen_orig  = imagen_a_grises(arr)
+                self.visor_orig.establecer_imagen(self._imagen_color)
+            else:
+                self._imagen_color = None
+                self._imagen_orig  = imagen_a_grises(arr)
+                self.visor_orig.establecer_imagen(self._imagen_orig)
+
+            self._resultado = None
             self.visor_recon.limpiar()
+            modo_txt = 'color' if es_color else 'grises'
             self.statusBar().showMessage(
-                f'Imagen cargada: {os.path.basename(ruta)}  '
+                f'Imagen cargada ({modo_txt}): {os.path.basename(ruta)}  '
                 f'({self._imagen_orig.shape[1]}x{self._imagen_orig.shape[0]} px)')
         except Exception as exc:
             QMessageBox.critical(self, 'Error al cargar imagen', str(exc))
@@ -782,9 +813,14 @@ class VentanaPrincipal(QMainWindow):
                       self._imagen_orig.shape[0])
 
         x, y, w, h = region
-        tile = self._imagen_orig[y:y+h, x:x+w]
 
-        if tile.size < 64:
+        # si la imagen cargada es a color, se recorta y reconstruye a color
+        # (luminancia-PDE); _imagen_orig (gris) sigue usandose para
+        # benchmark/lupa-fallback y como base de las herramientas de analisis.
+        fuente = self._imagen_color if self._imagen_color is not None else self._imagen_orig
+        tile = fuente[y:y+h, x:x+w, ...]
+
+        if tile.shape[0] * tile.shape[1] < 64:
             QMessageBox.warning(self, 'Region muy pequeña',
                                 'Haga zoom fuera o cargue una imagen mas grande.')
             return None
@@ -845,20 +881,50 @@ class VentanaPrincipal(QMainWindow):
         if self._hilo_lupa is not None and self._hilo_lupa.isRunning():
             return
 
-        radio = 60
+        # El radio de la lupa se adapta al zoom de la imagen original: se toma
+        # como una fraccion de la region actualmente visible. Con zoom in la
+        # region visible es chica -> radio chico -> la lupa amplia justo lo que
+        # se esta mirando. Con zoom out el radio queda topado (RADIO_MAX) para
+        # no terminar ampliando casi toda la imagen.
+        FRACCION_LUPA = 0.18
+        RADIO_MIN     = 20
+        RADIO_MAX     = 80
+        vp = self.visor_orig.obtener_viewport_imagen()
+        if vp is None:
+            radio = 60
+        else:
+            _, _, vw, vh = vp
+            radio = int(FRACCION_LUPA * min(vw, vh))
+            radio = max(RADIO_MIN, min(radio, RADIO_MAX))
+
         x0 = max(0, x_img - radio)
         y0 = max(0, y_img - radio)
         x1 = min(self._imagen_orig.shape[1], x_img + radio)
         y1 = min(self._imagen_orig.shape[0], y_img + radio)
 
-        tile = self._imagen_orig[y0:y1, x0:x1]
-        if tile.size < 64:
+        fuente = self._imagen_color if self._imagen_color is not None else self._imagen_orig
+        tile = fuente[y0:y1, x0:x1, ...]
+        if tile.shape[0] * tile.shape[1] < 64:
             return
 
         factor = 3
         params = self.panel_params.obtener_params()
 
         def _tarea_lupa(t=tile, f=factor, p=params):
+            # Modo lupa: solo el solve screened, sin shock/difusion (se
+            # prioriza la velocidad en tiempo real). A color, se resuelve
+            # solo la luminancia y el croma se recombina via bicubica.
+            if t.ndim == 3:
+                y, cb, cr = rgb_a_ycbcr(t)
+                problema = construir_problema_screened(y, f, lam=p['lam'],
+                                                         beta=p['beta'], tau=p['tau'])
+                res = resolver_screened(problema, max_iter=400, tol=1e-4)
+                y_up = res['imagen_recon']
+                new_h, new_w = y_up.shape
+                cb_up = resize_float(cb, new_w, new_h, Image.BICUBIC)
+                cr_up = resize_float(cr, new_w, new_h, Image.BICUBIC)
+                return ycbcr_a_rgb(y_up, np.clip(cb_up, 0.0, 1.0), np.clip(cr_up, 0.0, 1.0))
+
             problema = construir_problema_screened(t, f, lam=p['lam'],
                                                      beta=p['beta'], tau=p['tau'])
             res = resolver_screened(problema, max_iter=400, tol=1e-4)
@@ -884,15 +950,53 @@ class VentanaPrincipal(QMainWindow):
         params = self.panel_params.obtener_params()
 
         def _tarea_animacion(t=tile, p=params):
-            problema = construir_problema_upscale(t, p['factor'])
-            return resolver_con_snapshots(
-                problema,
-                omega=p['omega'],
-                tol=p['tol'],
-                max_iter=min(p['max_iter'], 600),
-                ecuacion='laplace',
-                cada_n_iter=15
+            es_color = t.ndim == 3
+            kwargs_realce = dict(
+                usar_difusion=p['usar_difusion'],
+                usar_shock=p['usar_shock'],
             )
+
+            if es_color:
+                y, cb, cr = rgb_a_ycbcr(t)
+                canal = y
+            else:
+                canal = t
+
+            res = upscale_poisson_screened(
+                canal, p['factor'],
+                lam=p['lam'], beta=p['beta'], tau=p['tau'],
+                usar_back_projection=p['back_projection'],
+                usar_anti_ringing=p['anti_ringing'],
+                usar_multiescala=p['multiescala'],
+                tol=p['tol'], max_iter=p['max_iter'],
+                capturar_snapshots=True,
+            )
+
+            th, tw = canal.shape
+            if es_color:
+                # croma fijo (no participa de la convergencia): se reescala
+                # una sola vez y se recombina con cada snapshot de Y.
+                frames = [finalizar_display_color(s, cb, cr, y, p['factor'],
+                                                    p['usm_pct'], **kwargs_realce)
+                          for s in res['snapshots']]
+                bic = resize_rgb_float(t, tw * p['factor'], th * p['factor'], Image.BICUBIC)
+            else:
+                frames = [finalizar_display(s, t, p['factor'], p['usm_pct'], **kwargs_realce)
+                          for s in res['snapshots']]
+                pil_tile = Image.fromarray(
+                    (np.clip(t, 0.0, 1.0) * 255).astype(np.uint8), mode='L')
+                bic = np.array(
+                    pil_tile.resize((tw * p['factor'], th * p['factor']), Image.BICUBIC),
+                    dtype=np.float64) / 255.0
+
+            return {
+                'snapshots':   frames,
+                'bicubica':    bic,
+                'iteraciones': res['iteraciones'],
+                'tiempo':      res['tiempo'],
+                'omega':       res['omega'],
+                'etapas':      res['etapas'],
+            }
 
         ok = self._iniciar_hilo(_tarea_animacion)
         if not ok:
@@ -904,6 +1008,7 @@ class VentanaPrincipal(QMainWindow):
     def _mostrar_dialogo_animacion(self, resultado: dict):
         from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
                                        QPushButton, QLabel, QSlider)
+        from PySide6.QtWidgets import QComboBox
         from PySide6.QtCore import QTimer, Qt
 
         snapshots = resultado.get('snapshots', [])
@@ -912,20 +1017,43 @@ class VentanaPrincipal(QMainWindow):
             return
 
         dialogo = QDialog(self)
-        dialogo.setWindowTitle('Animacion de Convergencia SOR Red-Black')
-        dialogo.resize(700, 650)
+        dialogo.setWindowTitle('Animacion de Convergencia (modelo screened)')
+        dialogo.resize(1000, 650)
         dialogo.setStyleSheet(ESTILO)
 
         layout = QVBoxLayout(dialogo)
 
-        lbl_info = QLabel(f"Snapshots: {len(snapshots)} | "
+        etapas_txt = ' -> '.join(f'x{e}' for e in resultado.get('etapas', []))
+        lbl_info = QLabel(f"Frames: {len(snapshots)} | "
+                          f"Cascada: {etapas_txt} | "
+                          f"Omega: {resultado['omega']:.3f} | "
                           f"Iteraciones totales: {resultado['iteraciones']} | "
                           f"Tiempo: {resultado['tiempo']:.3f}s")
         lbl_info.setStyleSheet('color: #2196F3; font-weight: bold; padding: 4px;')
         layout.addWidget(lbl_info)
 
+        visores_layout = QHBoxLayout()
+
+        col_anim = QVBoxLayout()
+        lbl_anim = QLabel('SOR screened (animado)')
+        lbl_anim.setAlignment(Qt.AlignCenter)
+        lbl_anim.setStyleSheet('color: #B0B0B0;')
+        col_anim.addWidget(lbl_anim)
         visor_temp = VisorImagen()
-        layout.addWidget(visor_temp)
+        col_anim.addWidget(visor_temp)
+        visores_layout.addLayout(col_anim)
+
+        col_bic = QVBoxLayout()
+        lbl_bic = QLabel('Bicubica (referencia fija)')
+        lbl_bic.setAlignment(Qt.AlignCenter)
+        lbl_bic.setStyleSheet('color: #B0B0B0;')
+        col_bic.addWidget(lbl_bic)
+        visor_bic = VisorImagen()
+        visor_bic.establecer_imagen(resultado['bicubica'])
+        col_bic.addWidget(visor_bic)
+        visores_layout.addLayout(col_bic)
+
+        layout.addLayout(visores_layout)
 
         slider = QSlider(Qt.Horizontal)
         slider.setRange(0, len(snapshots) - 1)
@@ -950,25 +1078,59 @@ class VentanaPrincipal(QMainWindow):
         btn_play  = QPushButton('▶ Reproducir')
         btn_pause = QPushButton('⏸ Pausar')
         btn_close = QPushButton('Cerrar')
+
+        lbl_vel = QLabel('Velocidad:')
+        lbl_vel.setStyleSheet('color: #B0B0B0;')
+        combo_vel = QComboBox()
+        # ms por frame; "Lento" por defecto para que la mejora se note bien.
+        VELOCIDADES = {'Lento': 700, 'Normal': 400, 'Rapido': 200}
+        combo_vel.addItems(list(VELOCIDADES.keys()))
+        combo_vel.setCurrentText('Lento')
+
+        btn_layout.addWidget(lbl_vel)
+        btn_layout.addWidget(combo_vel)
         for b in (btn_play, btn_pause, btn_close):
             b.setMinimumHeight(32)
             btn_layout.addWidget(b)
         layout.addLayout(btn_layout)
 
+        # multiplicador de pausa sobre el ultimo frame (la reconstruccion
+        # final), para que el resultado se quede mas tiempo en pantalla.
+        PAUSA_FINAL_MULT = 4
+
         def actualizar_frame(idx):
             visor_temp.establecer_imagen(snapshots[idx])
-            iter_aprox = idx * resultado.get('cada_n_iter', 15)
-            lbl_frame.setText(f'Frame {idx + 1} / {len(snapshots)}  |  '
-                              f'Iteracion aproximada: {iter_aprox}')
+            es_final = idx == len(snapshots) - 1
+            extra = '  |  Reconstruccion final' if es_final else ''
+            lbl_frame.setText(f'Frame {idx + 1} / {len(snapshots)}{extra}')
 
         slider.valueChanged.connect(actualizar_frame)
 
         timer = QTimer(dialogo)
-        timer.timeout.connect(
-            lambda: slider.setValue((slider.value() + 1) % len(snapshots))
-        )
 
-        btn_play.clicked.connect(lambda: timer.start(166))
+        def avanzar():
+            idx = (slider.value() + 1) % len(snapshots)
+            slider.setValue(idx)
+            # si el frame que se acaba de mostrar es el ultimo (la
+            # reconstruccion), alargar la pausa antes de reiniciar el bucle.
+            base = VELOCIDADES[combo_vel.currentText()]
+            es_final = idx == len(snapshots) - 1
+            timer.setInterval(base * PAUSA_FINAL_MULT if es_final else base)
+
+        timer.timeout.connect(avanzar)
+
+        def iniciar():
+            timer.start(VELOCIDADES[combo_vel.currentText()])
+
+        def cambiar_velocidad():
+            if timer.isActive():
+                idx = slider.value()
+                base = VELOCIDADES[combo_vel.currentText()]
+                es_final = idx == len(snapshots) - 1
+                timer.setInterval(base * PAUSA_FINAL_MULT if es_final else base)
+
+        combo_vel.currentTextChanged.connect(cambiar_velocidad)
+        btn_play.clicked.connect(iniciar)
         btn_pause.clicked.connect(timer.stop)
         btn_close.clicked.connect(dialogo.accept)
 
@@ -982,46 +1144,57 @@ class VentanaPrincipal(QMainWindow):
         Ejecuta el pipeline screened y produce la imagen AMPLIADA lista para
         mostrar (sin reducir de vuelta al tamaño del tile ni incrustar).
 
-        Aplica USM (si fuerza>0) y, al final, anti-ringing contra una guia
-        bicubica del mismo tamaño: esto recorta el overshoot del USM
-        (el "halo" blanco) sin perder el realce del modelo screened.
+        Aplica el stack de nitidez (difusion + shock + USM opcional) y, al
+        final, anti-ringing contra una guia bicubica del mismo tamaño: esto
+        recorta el overshoot sin perder el realce del modelo screened.
+
+        Si 'tile' es a color (h,w,3), reconstruye con el enfoque
+        luminancia-PDE: el canal Y pasa por el solver y el stack de nitidez
+        completos, Cb/Cr se reescalan a bicubica y se recombinan
+        (finalizar_display_color). Devuelve el mismo dict con 'display',
+        'nn' y 'bicubica' en RGB.
         """
+        es_color = tile.ndim == 3
+
+        if es_color:
+            y, cb, cr = rgb_a_ycbcr(tile)
+            canal = y
+        else:
+            canal = tile
+
         res = upscale_poisson_screened(
-            tile, factor,
+            canal, factor,
             lam=params['lam'], beta=params['beta'], tau=params['tau'],
             usar_back_projection=params['back_projection'],
             usar_anti_ringing=params['anti_ringing'],
             usar_multiescala=params['multiescala'],
             tol=params['tol'], max_iter=params['max_iter'],
         )
-        big = res['imagen_recon']
-        new_h, new_w = big.shape
 
-        th, tw = tile.shape
+        th, tw = canal.shape
         sor_h_fit = th * factor
         sor_w_fit = tw * factor
 
-        pil_big = Image.fromarray(
-            (np.clip(big, 0.0, 1.0) * 255).astype(np.uint8), mode='L')
-        if (new_w, new_h) != (sor_w_fit, sor_h_fit):
-            pil_big = pil_big.resize((sor_w_fit, sor_h_fit), Image.LANCZOS)
+        kwargs_realce = dict(
+            usar_difusion=params['usar_difusion'],
+            usar_shock=params['usar_shock'],
+        )
 
-        pil_tile = Image.fromarray(
-            (np.clip(tile, 0.0, 1.0) * 255).astype(np.uint8), mode='L')
-        bic = np.array(pil_tile.resize((sor_w_fit, sor_h_fit), Image.BICUBIC),
-                       dtype=np.float64) / 255.0
-        nn = np.array(pil_tile.resize((sor_w_fit, sor_h_fit), Image.NEAREST),
-                      dtype=np.float64) / 255.0
-
-        usm_pct = params['usm_pct']
-        if usm_pct > 0:
-            pil_big = pil_big.filter(
-                ImageFilter.UnsharpMask(radius=1.5, percent=usm_pct, threshold=2))
-
-        display = np.array(pil_big, dtype=np.float64) / 255.0
-        # anti-ringing AL FINAL: recorta el overshoot del USM al rango local
-        # de la guia bicubica, sin deshacer el realce de beta.
-        display = anti_ringing(display, bic)
+        if es_color:
+            bic = resize_rgb_float(tile, sor_w_fit, sor_h_fit, Image.BICUBIC)
+            nn  = resize_rgb_float(tile, sor_w_fit, sor_h_fit, Image.NEAREST)
+            display = finalizar_display_color(
+                res['imagen_recon'], cb, cr, y, factor, params['usm_pct'],
+                **kwargs_realce)
+        else:
+            pil_tile = Image.fromarray(
+                (np.clip(tile, 0.0, 1.0) * 255).astype(np.uint8), mode='L')
+            bic = np.array(pil_tile.resize((sor_w_fit, sor_h_fit), Image.BICUBIC),
+                           dtype=np.float64) / 255.0
+            nn = np.array(pil_tile.resize((sor_w_fit, sor_h_fit), Image.NEAREST),
+                          dtype=np.float64) / 255.0
+            display = finalizar_display(res['imagen_recon'], tile, factor,
+                                          params['usm_pct'], **kwargs_realce)
 
         return {
             'display':      display,
@@ -1165,9 +1338,15 @@ class VentanaPrincipal(QMainWindow):
             factor = params['factor']
 
             # vista a mostrar: misma ampliacion real que "Reconstruir"
-            # (modelo screened completo, con USM + anti-ringing)
+            # (modelo screened completo, con USM + anti-ringing). Si la
+            # imagen es a color, disp['display'] queda en RGB.
             disp = self._upscale_display(tile, factor, params)
             res_poi = disp['res']
+
+            # Las metricas (PSNR/SSIM/GMSD) y la tabla comparativa son 2D
+            # (luminancia): si el tile es a color, se reduce a gris solo
+            # para esta seccion de analisis.
+            tile_gris = imagen_a_grises(tile) if tile.ndim == 3 else tile
 
             # tabla psnr/ssim/gmsd: metodologia degradar/factor -> reconstruir
             # con el modelo screened, sin realce (beta=1, "suave") y con el
@@ -1175,11 +1354,11 @@ class VentanaPrincipal(QMainWindow):
             th_lr = max(2, th // factor)
             tw_lr = max(2, tw // factor)
             pil_tile = Image.fromarray(
-                (np.clip(tile, 0.0, 1.0) * 255).astype(np.uint8), mode='L')
+                (np.clip(tile_gris, 0.0, 1.0) * 255).astype(np.uint8), mode='L')
             pil_lr = pil_tile.resize((tw_lr, th_lr), Image.LANCZOS)
             lr = np.array(pil_lr, dtype=np.float64) / 255.0
 
-            bic = interpolacion_bicubica(tile, factor)
+            bic = interpolacion_bicubica(tile_gris, factor)
 
             res_suave = upscale_poisson_screened(
                 lr, factor, lam=params['lam'], beta=1.0, tau=params['tau'],
@@ -1203,12 +1382,12 @@ class VentanaPrincipal(QMainWindow):
             suave  = _a_tamano_tile(res_suave['imagen_recon'])
             realce = _a_tamano_tile(res_realce['imagen_recon'])
 
-            tabla = tabla_comparativa(tile, bic, suave, realce)
+            tabla = tabla_comparativa(tile_gris, bic, suave, realce)
 
             return {
                 'imagen_completa': disp['display'],
                 'imagen_upscale':  disp['display'],
-                'original': tile,
+                'original': tile_gris,
                 'bicubica': bic,
                 'laplace': suave,
                 'poisson': realce,
@@ -1246,6 +1425,8 @@ class VentanaPrincipal(QMainWindow):
             return
 
         tile = info[0]
+        if tile.ndim == 3:
+            tile = imagen_a_grises(tile)
         params = self.panel_params.obtener_params()
 
         def _tarea():

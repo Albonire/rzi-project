@@ -442,3 +442,63 @@ def resolver_con_snapshots(problema: dict, omega: float = None, tol: float = 1e-
         'ecuacion': ecuacion,
         'cada_n_iter': cada_n_iter,
     }
+
+
+def resolver_screened_con_snapshots(problema: dict, omega: float = None, tol: float = 1e-4,
+                                     max_iter: int = 600, cada_n_iter: int = 8) -> dict:
+    """
+    Version de resolver_screened() que captura snapshots del estado de la
+    malla cada 'cada_n_iter' iteraciones (incluye el estado inicial, la guia
+    bicubica). Util para animar la convergencia del modelo screened.
+
+    Retorna el mismo formato que resolver_screened(), mas:
+    'snapshots'    : lista de ndarrays float64 [0,1] (cada uno en la grilla
+                     de esta etapa).
+    'cada_n_iter'  : int.
+    """
+    nrows, ncols = problema['forma']
+
+    if omega is None:
+        omega = problema['omega_opt']
+
+    u       = np.ascontiguousarray(problema['imagen_baja'].copy(), dtype=np.float64)
+    b       = np.ascontiguousarray(problema['b'], dtype=np.float64)
+    lam_map = np.ascontiguousarray(problema['lam_map'], dtype=np.float64)
+
+    snapshots = []
+    t0 = time.perf_counter()
+
+    snapshots.append(np.clip(u.copy(), 0.0, 1.0))
+
+    iteraciones_totales = 0
+    convergio = False
+    historial_acumulado = []
+
+    for bloque in range(0, max_iter, cada_n_iter):
+        iters_bloque = min(cada_n_iter, max_iter - bloque)
+        u, iters, conv, hist = _kernel_sor_rb_screened(
+            u, b, lam_map, float(omega), int(iters_bloque), float(tol)
+        )
+        iteraciones_totales += iters
+        historial_acumulado.extend(hist.tolist())
+
+        snapshots.append(np.clip(u.copy(), 0.0, 1.0))
+
+        if conv:
+            convergio = True
+            break
+
+    tiempo = time.perf_counter() - t0
+
+    return {
+        'imagen_recon': np.clip(u, 0.0, 1.0),
+        'snapshots': snapshots,
+        'iteraciones': iteraciones_totales,
+        'convergio': convergio,
+        'historial': np.array(historial_acumulado),
+        'tiempo': tiempo,
+        'omega': float(omega),
+        'ecuacion': 'screened',
+        'lam': problema.get('lam', 0.0),
+        'cada_n_iter': cada_n_iter,
+    }

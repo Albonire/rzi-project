@@ -19,6 +19,8 @@ import numpy as np
 from PIL import Image
 from scipy.ndimage import gaussian_filter
 
+from core.image_ops import resize_float
+
 
 def imagen_a_grises(imagen: np.ndarray) -> np.ndarray:
     """
@@ -226,6 +228,11 @@ def _preparar_guia_bicubica(tile: np.ndarray, factor: int) -> tuple:
     Helper compartido: aplica el tope de memoria/rendimiento, construye la
     malla fina alineada por esquinas y devuelve la guia bicubica G.
 
+    Todo el reescalado se hace en float64 (ver core/image_ops.resize_float):
+    evita el viaje intermedio por uint8 (256 niveles), que introduce
+    escalones (banding) en degradados suaves y se propaga a toda la
+    reconstruccion (G es el warm start y la base del termino b del solver).
+
     Retorna (tile_ajustado, G, new_h, new_w).
     """
     if tile.ndim != 2:
@@ -245,19 +252,13 @@ def _preparar_guia_bicubica(tile: np.ndarray, factor: int) -> tuple:
         )
         h_small = max(2, (int(new_h_pre * escala) - 1) // factor + 1)
         w_small = max(2, (int(new_w_pre * escala) - 1) // factor + 1)
-        pil_small = Image.fromarray(
-            (np.clip(tile, 0.0, 1.0) * 255).astype(np.uint8), mode='L')
-        pil_small = pil_small.resize((w_small, h_small), Image.LANCZOS)
-        tile = np.asarray(pil_small, dtype=np.float64) / 255.0
+        tile = np.clip(resize_float(tile, w_small, h_small, Image.LANCZOS), 0.0, 1.0)
         h, w = tile.shape
 
     new_h = (h - 1) * factor + 1
     new_w = (w - 1) * factor + 1
 
-    pil_tile = Image.fromarray(
-        (np.clip(tile, 0.0, 1.0) * 255).astype(np.uint8), mode='L')
-    pil_guia = pil_tile.resize((new_w, new_h), Image.BICUBIC)
-    G = np.asarray(pil_guia, dtype=np.float64) / 255.0
+    G = np.clip(resize_float(tile, new_w, new_h, Image.BICUBIC), 0.0, 1.0)
 
     return tile, G, new_h, new_w
 
