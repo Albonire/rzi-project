@@ -46,8 +46,8 @@ def _descomponer_factor(factor: int) -> list:
 _resize_float = resize_float
 
 
-def back_projection(u: np.ndarray, f_lr: np.ndarray, n_pass: int = 3,
-                     gain: float = 0.8) -> np.ndarray:
+def back_projection(u: np.ndarray, f_lr: np.ndarray, n_pass: int = 2,
+                     gain: float = 0.6) -> np.ndarray:
     """
     Refuerza la consistencia Down(u) ~= f_lr (seccion C del documento).
 
@@ -60,9 +60,10 @@ def back_projection(u: np.ndarray, f_lr: np.ndarray, n_pass: int = 3,
       4. u <- u + gain * Up(residuo).
 
     Cada pasada minimiza el residuo ||Down(u) - f_lr||, recuperando alta
-    frecuencia de forma principiada ("back-projection iterativa reforzada").
-    n_pass=3 (por defecto) converge mejor que 2 sin llegar a oscilar;
-    gain<1 amortigua cualquier sobre-correccion entre pasadas.
+    frecuencia de forma principiada ("back-projection iterativa").
+    n_pass=2 y gain=0.6 (por defecto) equilibran fidelidad y ruido: el paso
+    re-inyecta las altas frecuencias del tile original, incluyendo grano; un
+    gain menor reduce ese ruido sin sacrificar la mejora de fidelidad.
     """
     h_lr, w_lr = f_lr.shape
     h_hi, w_hi = u.shape
@@ -182,13 +183,215 @@ def finalizar_display_color(y_recon: np.ndarray, cb: np.ndarray, cr: np.ndarray,
     return ycbcr_a_rgb(y_disp, cb_disp, cr_disp)
 
 
+def generar_frames_pipeline(
+    canal: np.ndarray, factor: int,
+    *,
+    lam: float = 8.0, beta: float = 1.7, tau: float = 0.02,
+    usar_back_projection: bool = True,
+    usar_anti_ringing: bool = True,
+    usar_multiescala: bool = True,
+    usar_difusion: bool = True,
+    usar_shock: bool = True,
+    usm_pct: float = 60.0,
+    tol: float = 1e-4, max_iter: int = 600,
+    snapshots_cada: int = 8,
+    max_snaps_por_etapa: int = 14,
+    n_back_pass: int = 2, back_gain: float = 0.6,
+) -> dict:
+    """
+    Genera la secuencia didactica completa de frames para "Animar Convergencia".
+
+    Recorre TODO el pipeline RZI en orden, capturando un frame en cada fase:
+    imagen original (NN), interpolacion bicubica, cascada SOR por etapa,
+    back-projection, anti-ringing inicial, difusion anisotropica, filtro de
+    shock, USM opcional, y reconstruccion final.
+
+    El ultimo frame es IDENTICO al que produce finalizar_display() con los
+    mismos parametros, usando las mismas primitivas en el mismo orden.
+
+    Todos los frames tienen forma (th*factor, tw*factor), float64 [0,1].
+
+    Retorna un dict:
+        'frames'         : lista de ndarrays 2D float64 [0,1] a tamano display.
+        'pasos'          : lista de nombres de los pasos del proceso (para la
+                           lista lateral del dialogo).
+        'pasos_de_frame' : indice en 'pasos' de cada frame (para resaltar el
+                           paso actual en el listado).
+        'subtitulos'     : leyenda descriptiva de cada frame.
+        'omega'          : omega SOR de la ultima etapa.
+        'iteraciones'    : total de iteraciones SOR.
+        'tiempo'         : tiempo total de SOR (sin resize/filtros).
+        'etapas'         : lista de factores de cada etapa de la cascada.
+    """
+    th, tw = canal.shape
+    out_h, out_w = th * factor, tw * factor
+    f_lr = canal.astype(np.float64)
+
+    frames       = []
+    pasos        = []
+    pasos_idx    = []   # indice en 'pasos' para cada frame
+    subtitulos   = []
+
+    def agregar(frame, paso, subtitulo):
+        f_clip = np.clip(frame.astype(np.float64), 0.0, 1.0)
+        if paso not in pasos:
+            pasos.append(paso)
+        pasos_idx.append(pasos.index(paso))
+        frames.append(f_clip)
+        subtitulos.append(subtitulo)
+
+    # --- Fase 1: interpolacion (creacion de pixeles) ---
+    nn = resize_float(f_lr, out_w, out_h, Image.NEAREST)
+    agregar(nn, 'Imagen original / vecino mas cercano',
+            'Imagen de entrada ampliada con vecino mas cercano: se ven los '
+            'pocos pixeles conocidos. NN no crea nueva informacion.')
+    agregar(nn, 'Imagen original / vecino mas cercano',
+            'NN replica cada pixel LR en un bloque solido: aspecto pixelado, '
+            'sin suavizado. Esta es la referencia de partida.')
+
+    bic_display = np.clip(resize_float(f_lr, out_w, out_h, Image.BICUBIC), 0.0, 1.0)
+    agregar(bic_display, 'Interpolacion bicubica (guia G)',
+            'Bicubica: crea pixeles nuevos usando los 16 vecinos mas proximos '
+            'con pesos cubicos. Imagen suave pero sin detalle fino. '
+            'Esta guia G es el punto de partida del solver Poisson.')
+
+    # --- Fase 2: cascada SOR screened ---
+    if usar_multiescala:
+        etapas = _descomponer_factor(factor)
+    else:
+        etapas = [factor]
+
+    u = f_lr.copy()
+    iters_total  = 0
+    tiempo_total = 0.0
+    omega_usado  = 1.0
+    convergio_total = True
+    factor_acum  = 1
+
+    for i_et, etapa_factor in enumerate(etapas):
+        if etapa_factor <= 1:
+            continue
+
+        factor_acum *= etapa_factor
+        nombre_paso = f'SOR Screened - etapa {i_et + 1} (escala x{factor_acum})'
+
+        problema = construir_problema_screened(u, etapa_factor,
+                                               lam=lam, beta=beta, tau=tau)
+        resultado = resolver_screened_con_snapshots(
+            problema, tol=tol, max_iter=max_iter,
+            cada_n_iter=snapshots_cada)
+
+        snaps_orig  = resultado['snapshots']
+        n_orig      = len(snaps_orig)
+        iter_nums_o = [k * snapshots_cada for k in range(n_orig)]
+
+        if n_orig > max_snaps_por_etapa:
+            sel = np.linspace(0, n_orig - 1, max_snaps_por_etapa).round().astype(int)
+            sel = sorted(set(sel.tolist()))
+            snaps    = [snaps_orig[i] for i in sel]
+            iters_sn = [iter_nums_o[i] for i in sel]
+        else:
+            snaps    = snaps_orig
+            iters_sn = iter_nums_o
+
+        omega_et = resultado['omega']
+        for snap, n_it in zip(snaps, iters_sn):
+            vis = resize_float(snap, out_w, out_h, Image.LANCZOS)
+            agregar(vis, nombre_paso,
+                    f'SOR Red-Black convergiendo | iter ~{n_it} | '
+                    f'omega = {omega_et:.3f} | '
+                    f'Poisson screened: (4+lam)*u = b + lam*G')
+
+        u             = resultado['imagen_recon']
+        iters_total  += resultado['iteraciones']
+        tiempo_total += resultado['tiempo']
+        omega_usado   = omega_et
+        convergio_total = convergio_total and resultado['convergio']
+
+    # --- Fase 3: back-projection ---
+    if usar_back_projection:
+        u_bp = back_projection(u, f_lr, n_pass=n_back_pass, gain=back_gain)
+        vis_bp = resize_float(np.clip(u_bp, 0.0, 1.0), out_w, out_h, Image.LANCZOS)
+        agregar(vis_bp, 'Back-projection',
+                f'Correccion iterativa ({n_back_pass} pasadas, gain={back_gain:.2f}): '
+                f'fuerza Down(u) ~= tile original. '
+                f'Cada pasada aplica u <- u + gain * Up(tile - Down(u)).')
+        u = u_bp
+
+    # --- Fase 4: anti-ringing inicial (escala del solver) ---
+    if usar_anti_ringing:
+        new_h, new_w = u.shape
+        ref_solver = _resize_float(f_lr, new_w, new_h, Image.BICUBIC)
+        u_ar = anti_ringing(u, ref_solver)
+        vis_ar = resize_float(np.clip(u_ar, 0.0, 1.0), out_w, out_h, Image.LANCZOS)
+        agregar(vis_ar, 'Anti-ringing inicial',
+                'Recorta u al rango [min, max] local 3x3 de la guia bicubica: '
+                'elimina el overshoot cerca de bordes sin borrar el realce.')
+        u = u_ar
+    elif not usar_back_projection:
+        # sin BP ni AR: mostrar la salida cruda del solver a escala display
+        vis_raw = resize_float(np.clip(u, 0.0, 1.0), out_w, out_h, Image.LANCZOS)
+        agregar(vis_raw, 'Salida del solver SOR',
+                'Resultado del solver antes del realce perceptual: '
+                'buena fidelidad matematica, todavia algo suave.')
+
+    # --- Preparar imagen a tamano display (LANCZOS, primer paso de finalizar_display) ---
+    u = np.clip(u, 0.0, 1.0)
+    if u.shape != (out_h, out_w):
+        display = resize_float(u, out_w, out_h, Image.LANCZOS)
+    else:
+        display = u.copy()
+
+    # --- Fase 5: difusion anisotropica (denoise, Perona-Malik) ---
+    if usar_difusion:
+        display = anisotropic_diffusion(display)
+        agregar(display, 'Difusion anisotropica (denoise)',
+                'Perona-Malik: g(d) = 1/(1+(d/kappa)^2). '
+                'Difunde dentro de regiones homogeneas (g~1) y no en bordes (g~0). '
+                'Limpia grano sin difuminar contornos.')
+
+    # --- Fase 6: filtro de shock (Osher-Rudin) ---
+    if usar_shock:
+        display = shock_filter(display)
+        agregar(display, 'Filtro de shock (nitidez de bordes)',
+                'Osher-Rudin: u_t = -sign(Lap_sigma(u)) * |grad u|. '
+                'Convierte rampas borrosas en transiciones nitidas; '
+                'en zonas planas (|grad u|~0) no actua.')
+
+    # --- Fase 7: realce USM (opcional) ---
+    if usm_pct > 0:
+        display = unsharp_mask_float(display, percent=usm_pct)
+        agregar(display, 'Realce USM',
+                f'Unsharp masking ({usm_pct:.0f}%): resta una version gaussiana '
+                f'para acentuar bordes. El shock ya hace el grueso; USM es '
+                f'el ultimo toque de nitidez.')
+
+    # --- Fase 8: reconstruccion final (anti-ringing sobre display) ---
+    final = anti_ringing(display, bic_display)
+    agregar(final, 'Reconstruccion final',
+            'Anti-ringing final contra la bicubica de display: acota el '
+            'overshoot residual. Este frame es identico al resultado del '
+            'boton Reconstruir.')
+
+    return {
+        'frames':          frames,
+        'pasos':           pasos,
+        'pasos_de_frame':  pasos_idx,
+        'subtitulos':      subtitulos,
+        'omega':           omega_usado,
+        'iteraciones':     iters_total,
+        'tiempo':          tiempo_total,
+        'etapas':          etapas,
+    }
+
+
 def upscale_poisson_screened(tile: np.ndarray, factor: int = 4,
                               lam: float = 8.0, beta: float = 1.7,
                               tau: float = 0.02,
                               usar_back_projection: bool = True,
                               usar_anti_ringing: bool = True,
                               usar_multiescala: bool = True,
-                              n_back_pass: int = 3, back_gain: float = 0.8,
+                              n_back_pass: int = 2, back_gain: float = 0.6,
                               tol: float = 1e-4, max_iter: int = 600,
                               capturar_snapshots: bool = False,
                               snapshots_cada: int = 8,
