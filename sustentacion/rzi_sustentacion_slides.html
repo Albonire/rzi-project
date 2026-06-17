@@ -1,0 +1,1031 @@
+<!DOCTYPE html>
+<!-- RZI - Slides de sustentacion -->
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<title>RZI: Reconstructor de Zoom Iterativo -- Slides</title>
+<style>
+  @font-face {
+    font-family: "JetBrains Mono";
+    src: url("file:///home/fabian/.claude/skills/kami/assets/fonts/JetBrainsMono.woff2") format("woff2");
+    font-weight: 400;
+  }
+
+  @page {
+    size: 280mm 158mm;
+    margin: 0;
+    background: #f5f4ed;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --parchment:  #f5f4ed;
+    --ivory:      #faf9f5;
+    --near-black: #141413;
+    --dark-warm:  #3d3d3a;
+    --olive:      #504e49;
+    --stone:      #6b6a64;
+    --brand:      #1B365D;
+    --brand-tint: #EEF2F7;
+    --border:     #e8e6dc;
+    --border-soft:#e5e3d8;
+
+    --serif: Charter, Georgia, Palatino, serif;
+    --sans:  var(--serif);
+    --mono:  "JetBrains Mono", "SF Mono", Consolas, monospace;
+  }
+
+  body {
+    color: var(--near-black);
+    font-family: var(--serif);
+    font-size: 13pt;
+    line-height: 1.5;
+  }
+
+  .slide {
+    width: 280mm;
+    height: 158mm;
+    padding: 13mm 18mm 10mm 18mm;
+    background: var(--parchment);
+    break-after: page;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+  .slide:last-child { break-after: auto; }
+
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 8pt;
+    letter-spacing: 1.8pt;
+    text-transform: uppercase;
+    color: var(--stone);
+    margin-bottom: 3pt;
+  }
+
+  .slide-title {
+    font-family: var(--serif);
+    font-size: 21pt;
+    font-weight: 500;
+    line-height: 1.18;
+    letter-spacing: -0.2pt;
+    color: var(--near-black);
+    margin-bottom: 10pt;
+    border-left: 2.5pt solid var(--brand);
+    padding-left: 8pt;
+  }
+
+  h3 {
+    font-family: var(--serif);
+    font-size: 12pt;
+    font-weight: 500;
+    color: var(--brand);
+    margin-bottom: 4pt;
+    margin-top: 8pt;
+  }
+
+  p { font-size: 10.5pt; line-height: 1.5; color: var(--dark-warm); margin-bottom: 6pt; }
+
+  .lead {
+    font-size: 12pt;
+    line-height: 1.5;
+    color: var(--olive);
+    margin-bottom: 8pt;
+  }
+
+  ul, ol { padding-left: 16pt; margin-bottom: 6pt; }
+  li { font-size: 10.5pt; line-height: 1.5; color: var(--dark-warm); margin-bottom: 3pt; }
+  ul li::marker { color: var(--brand); }
+  ol li::marker { color: var(--brand); font-weight: 500; }
+
+  code {
+    font-family: var(--mono);
+    font-size: 8.5pt;
+    background: var(--ivory);
+    padding: 1pt 4pt;
+    border-radius: 2pt;
+    color: var(--dark-warm);
+  }
+
+  pre {
+    font-family: var(--mono);
+    font-size: 8pt;
+    line-height: 1.45;
+    background: var(--ivory);
+    border: 0.5pt solid var(--border);
+    border-radius: 3pt;
+    padding: 7pt 10pt;
+    margin: 5pt 0;
+    white-space: pre-wrap;
+    color: var(--near-black);
+  }
+  pre code { background: transparent; padding: 0; }
+
+  table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 8.5pt;
+    margin: 5pt 0;
+  }
+  table th {
+    text-align: left;
+    font-weight: 500;
+    color: var(--dark-warm);
+    padding: 4pt 6pt;
+    border-bottom: 1pt solid var(--border);
+    background: var(--ivory);
+  }
+  table td {
+    padding: 3pt 6pt;
+    border-bottom: 0.3pt solid var(--border-soft);
+    vertical-align: top;
+    font-size: 8.5pt;
+  }
+
+  .callout {
+    background: var(--ivory);
+    border-left: 2pt solid var(--brand);
+    padding: 7pt 12pt;
+    border-radius: 3pt;
+    margin: 6pt 0;
+    font-size: 10pt;
+    line-height: 1.5;
+    color: var(--olive);
+  }
+
+  .tag {
+    display: inline-block;
+    background: var(--brand-tint);
+    color: var(--brand);
+    font-family: var(--mono);
+    font-size: 7.5pt;
+    font-weight: 500;
+    padding: 1pt 5pt;
+    border-radius: 2pt;
+    letter-spacing: 0.3pt;
+    text-transform: uppercase;
+    margin-right: 3pt;
+  }
+
+  .page-num {
+    position: absolute;
+    bottom: 8mm;
+    right: 18mm;
+    font-family: var(--mono);
+    font-size: 8pt;
+    color: var(--stone);
+    letter-spacing: 0.5pt;
+  }
+
+  .footer-mark {
+    position: absolute;
+    bottom: 8mm;
+    left: 18mm;
+    font-family: var(--mono);
+    font-size: 8pt;
+    color: var(--stone);
+    letter-spacing: 1pt;
+  }
+
+  .bottom-line {
+    font-family: var(--serif);
+    font-size: 10pt;
+    font-weight: 500;
+    color: var(--brand);
+    position: absolute;
+    bottom: 14mm;
+    left: 18mm;
+    right: 18mm;
+    border-top: 0.5pt solid var(--border);
+    padding-top: 5pt;
+  }
+
+  .c2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16pt;
+    flex: 1;
+  }
+
+  .metric-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr;
+    gap: 10pt;
+    margin: 6pt 0;
+  }
+  .metric-card {
+    background: var(--ivory);
+    border-radius: 4pt;
+    padding: 8pt 10pt;
+    text-align: center;
+  }
+  .metric-value {
+    font-family: var(--serif);
+    font-size: 22pt;
+    font-weight: 500;
+    color: var(--brand);
+    display: block;
+    line-height: 1.1;
+  }
+  .metric-label {
+    font-family: var(--mono);
+    font-size: 7pt;
+    color: var(--stone);
+    text-transform: uppercase;
+    letter-spacing: 0.8pt;
+    display: block;
+    margin-top: 2pt;
+  }
+
+  figure { margin: 5pt 0; }
+  figure img { max-width: 100%; border-radius: 3pt; max-height: 72mm; display: block; margin: 0 auto; }
+  figcaption {
+    font-size: 7.5pt;
+    color: var(--stone);
+    text-align: center;
+    margin-top: 3pt;
+    line-height: 1.4;
+  }
+
+  /* COVER */
+  .cover {
+    align-items: center;
+    justify-content: center;
+    text-align: center;
+  }
+  .cover h1 {
+    font-family: var(--serif);
+    font-size: 36pt;
+    font-weight: 500;
+    line-height: 1.08;
+    letter-spacing: -0.5pt;
+    color: var(--near-black);
+    margin-bottom: 10pt;
+  }
+  .cover .sub {
+    font-size: 12pt;
+    line-height: 1.45;
+    color: var(--olive);
+    max-width: 48ch;
+    margin-bottom: 22pt;
+  }
+  .cover .meta {
+    font-family: var(--mono);
+    font-size: 8.5pt;
+    color: var(--stone);
+    letter-spacing: 1.2pt;
+    text-transform: uppercase;
+  }
+
+  /* SECTION BREAK slide */
+  .section-break {
+    background: var(--brand);
+    align-items: flex-start;
+    justify-content: flex-end;
+    padding-bottom: 20mm;
+  }
+  .section-break .sec-num {
+    font-family: var(--mono);
+    font-size: 7.5pt;
+    color: #8aa8c8;
+    letter-spacing: 2pt;
+    text-transform: uppercase;
+    margin-bottom: 6pt;
+  }
+  .section-break .sec-title {
+    font-family: var(--serif);
+    font-size: 28pt;
+    font-weight: 500;
+    color: var(--ivory);
+    line-height: 1.1;
+    letter-spacing: -0.3pt;
+    border-left: 2.5pt solid #8aa8c8;
+    padding-left: 10pt;
+  }
+  .section-break .page-num { color: #8aa8c8; }
+</style>
+</head>
+<body>
+
+<!-- Slide 01: PORTADA -->
+<section class="slide cover">
+  <h1>Reconstructor<br>de Zoom Iterativo</h1>
+  <div class="sub">Super-resolucion con SOR Red-Black, Numba<br>y la ecuacion de Poisson screened</div>
+  <div class="meta">Fabian &middot; Algoritmos &middot; 2026</div>
+</section>
+
+<!-- Slide 02: SECCION 1 -->
+<section class="slide section-break">
+  <div class="sec-num">Parte 01</div>
+  <div class="sec-title">Que resuelve<br>este proyecto</div>
+  <div class="page-num">01</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 03: El problema -->
+<section class="slide">
+  <span class="eyebrow">01 &middot; El problema</span>
+  <div class="slide-title">La bicubica interpola; RZI resuelve una ecuacion diferencial</div>
+
+  <div class="c2">
+    <div>
+      <h3>Interpolacion clasica (bicubica)</h3>
+      <p>Calcula cada pixel nuevo como una combinacion ponderada de los vecinos. No tiene informacion sobre la estructura: el resultado queda borroso.</p>
+    </div>
+    <div>
+      <h3>Enfoque PDE (RZI)</h3>
+      <p>Formula una ecuacion de Poisson cuya solucion produce la imagen mas nitida posible consistente con los pixeles originales y con los bordes de la guia.</p>
+    </div>
+  </div>
+
+  <div class="bottom-line">Clave: la EDP actua como regularizador que selecciona la imagen suave entre todas las soluciones posibles.</div>
+  <div class="page-num">02</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 04: Objetivo academico -->
+<section class="slide">
+  <span class="eyebrow">01 &middot; Objetivo academico</span>
+  <div class="slide-title">El proyecto implementa SOR Red-Black con Numba sobre mallas de hasta 1.2 millones de pixeles</div>
+
+  <ul>
+    <li>Resolver numericamente la ecuacion de Poisson screened usando diferencias finitas (stencil de 5 puntos).</li>
+    <li>Acelerar el solver con Numba <code>@njit(parallel=True)</code> y el ordenamiento Red-Black para paralelizar cada barrido.</li>
+    <li>Construir un pipeline completo: cascada multiescala, back-projection, difusion Perona-Malik, shock filter y soporte de color YCbCr.</li>
+  </ul>
+
+  <div class="callout">La EDP convierte el problema de super-resolucion en un sistema lineal disperso y diagonalmente dominante que SOR resuelve en pocas centenas de iteraciones.</div>
+
+  <div class="page-num">03</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 05: SECCION 2 -->
+<section class="slide section-break">
+  <div class="sec-num">Parte 02</div>
+  <div class="sec-title">Arquitectura<br>y uso</div>
+  <div class="page-num">04</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 06: Arquitectura -->
+<section class="slide">
+  <span class="eyebrow">02 &middot; Arquitectura</span>
+  <div class="slide-title">Tres capas con dependencias unidireccionales separan la GUI de la matematica</div>
+
+  <figure style="flex:1;">
+    <svg viewBox="0 0 700 180" xmlns="http://www.w3.org/2000/svg" style="width:100%;height:auto;max-height:68mm;">
+      <rect width="100%" height="100%" fill="#f5f4ed"/>
+      <!-- Capa 1 -->
+      <rect x="20" y="8"   width="660" height="40" rx="4" fill="#faf9f5" stroke="#141413" stroke-width="1"/>
+      <text x="36" y="26" fill="#504e49" font-size="6.5" font-family="'JetBrains Mono',monospace" letter-spacing="0.1em">CAPA 01 · ui/</text>
+      <text x="120" y="26" fill="#141413" font-size="11" font-weight="500" font-family="Charter,Georgia,serif">Interfaz grafica (PySide6)</text>
+      <text x="120" y="41" fill="#504e49" font-size="7.5" font-family="'JetBrains Mono',monospace">main_window.py · zoom_viewer.py · dialogos · QThread</text>
+
+      <!-- Flecha -->
+      <line x1="350" y1="48" x2="350" y2="64" stroke="#504e49" stroke-width="1.2" marker-end="url(#a6)"/>
+
+      <!-- Capa 2 FOCAL -->
+      <rect x="20" y="64"  width="660" height="48" rx="4" fill="#EEF2F7" stroke="#1B365D" stroke-width="1.5"/>
+      <text x="36" y="82" fill="#1B365D" font-size="6.5" font-family="'JetBrains Mono',monospace" letter-spacing="0.1em">CAPA 02 · core/ · FOCAL</text>
+      <text x="150" y="82" fill="#141413" font-size="11" font-weight="500" font-family="Charter,Georgia,serif">Nucleo matematico</text>
+      <text x="120" y="97" fill="#1B365D" font-size="7.5" font-family="'JetBrains Mono',monospace">poisson_builder · sor_solver · upscaler</text>
+      <text x="120" y="107" fill="#504e49" font-size="7.5" font-family="'JetBrains Mono',monospace">edge_enhance · image_ops</text>
+
+      <!-- Flecha -->
+      <line x1="350" y1="112" x2="350" y2="128" stroke="#504e49" stroke-width="1.2" marker-end="url(#a6)"/>
+
+      <!-- Capa 3 -->
+      <rect x="20" y="128" width="660" height="38" rx="4" fill="#f0efe8" stroke="#6b6a64" stroke-width="1"/>
+      <text x="36" y="146" fill="#6b6a64" font-size="6.5" font-family="'JetBrains Mono',monospace" letter-spacing="0.1em">CAPA 03 · services/</text>
+      <text x="140" y="146" fill="#141413" font-size="11" font-weight="500" font-family="Charter,Georgia,serif">Metricas y exportacion</text>
+      <text x="120" y="160" fill="#504e49" font-size="7.5" font-family="'JetBrains Mono',monospace">metrics.py (PSNR, SSIM, GMSD) · exporter.py (CSV, PNG, graficas)</text>
+
+      <defs>
+        <marker id="a6" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto">
+          <polygon points="0 0,7 2.5,0 5" fill="#504e49"/>
+        </marker>
+      </defs>
+    </svg>
+  </figure>
+
+  <div class="page-num">05</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 07: Flujo de uso -->
+<section class="slide">
+  <span class="eyebrow">02 &middot; Flujo de uso</span>
+  <div class="slide-title">El usuario selecciona una region, configura el factor y obtiene el compuesto ampliado en segundos</div>
+
+  <table>
+    <thead><tr><th>#</th><th>Paso</th><th>Accion del usuario</th><th>Resultado</th></tr></thead>
+    <tbody>
+      <tr><td>1</td><td>Abrir</td><td>Boton "Abrir imagen"</td><td>Imagen cargada en visor izquierdo</td></tr>
+      <tr><td>2</td><td>Seleccionar</td><td>Dibujar rectangulo sobre la region</td><td>Tile definido en coordenadas de imagen</td></tr>
+      <tr><td>3</td><td>Configurar</td><td>Ajustar factor, lambda, beta, tau</td><td>Parametros listos</td></tr>
+      <tr><td>4</td><td>Reconstruir</td><td>Pulsar "Reconstruir (Poisson SOR)"</td><td>Pipeline ejecuta en hilo separado</td></tr>
+      <tr><td>5</td><td>Ver</td><td>Visor derecho muestra compuesto</td><td>Region reconstruida en imagen ampliada</td></tr>
+      <tr><td>6</td><td>Guardar</td><td>Boton "Guardar imagen"</td><td>PNG o JPEG exportado</td></tr>
+    </tbody>
+  </table>
+
+  <div class="page-num">06</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 08: SECCION 3 -->
+<section class="slide section-break">
+  <div class="sec-num">Parte 03</div>
+  <div class="sec-title">Teoria matematica:<br>EDP y Poisson</div>
+  <div class="page-num">07</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 09: Stencil 5 puntos -->
+<section class="slide">
+  <span class="eyebrow">03 &middot; Laplaciano discreto</span>
+  <div class="slide-title">El stencil de 5 puntos aproxima el Laplaciano con diferencias finitas de segundo orden</div>
+
+  <div class="c2">
+    <div>
+      <p>El Laplaciano continuo:</p>
+      <pre><code>Delta u = d2u/dx2 + d2u/dy2</code></pre>
+      <p>Su aproximacion discreta en malla de paso h:</p>
+      <pre><code>Delta_h u[i,j] =
+  (u[i+1,j] + u[i-1,j]
+   + u[i,j+1] + u[i,j-1]
+   - 4*u[i,j]) / h^2</code></pre>
+      <p>La EDP <code>Delta u = 0</code> implica que <em>cada pixel es el promedio de sus cuatro vecinos.</em></p>
+    </div>
+    <div style="display:flex;align-items:center;justify-content:center;">
+      <svg viewBox="0 0 200 200" xmlns="http://www.w3.org/2000/svg" style="width:160px;height:auto;">
+        <rect width="100%" height="100%" fill="#f5f4ed"/>
+        <!-- N -->
+        <rect x="65" y="8" width="70" height="54" rx="4" fill="#faf9f5" stroke="#141413" stroke-width="1"/>
+        <text x="100" y="34" fill="#504e49" font-size="8" font-family="'JetBrains Mono',monospace" text-anchor="middle">u[i-1,j]</text>
+        <text x="100" y="53" fill="#1B365D" font-size="13" font-weight="500" font-family="Charter,Georgia,serif" text-anchor="middle">-1</text>
+        <!-- O -->
+        <rect x="4" y="73" width="70" height="54" rx="4" fill="#faf9f5" stroke="#141413" stroke-width="1"/>
+        <text x="39" y="99" fill="#504e49" font-size="8" font-family="'JetBrains Mono',monospace" text-anchor="middle">u[i,j-1]</text>
+        <text x="39" y="118" fill="#1B365D" font-size="13" font-weight="500" font-family="Charter,Georgia,serif" text-anchor="middle">-1</text>
+        <!-- Centro -->
+        <rect x="65" y="73" width="70" height="54" rx="4" fill="#EEF2F7" stroke="#1B365D" stroke-width="1.5"/>
+        <text x="100" y="97" fill="#141413" font-size="8" font-family="'JetBrains Mono',monospace" text-anchor="middle">u[i,j]</text>
+        <text x="100" y="118" fill="#1B365D" font-size="15" font-weight="500" font-family="Charter,Georgia,serif" text-anchor="middle">+4</text>
+        <!-- E -->
+        <rect x="126" y="73" width="70" height="54" rx="4" fill="#faf9f5" stroke="#141413" stroke-width="1"/>
+        <text x="161" y="99" fill="#504e49" font-size="8" font-family="'JetBrains Mono',monospace" text-anchor="middle">u[i,j+1]</text>
+        <text x="161" y="118" fill="#1B365D" font-size="13" font-weight="500" font-family="Charter,Georgia,serif" text-anchor="middle">-1</text>
+        <!-- S -->
+        <rect x="65" y="138" width="70" height="54" rx="4" fill="#faf9f5" stroke="#141413" stroke-width="1"/>
+        <text x="100" y="164" fill="#504e49" font-size="8" font-family="'JetBrains Mono',monospace" text-anchor="middle">u[i+1,j]</text>
+        <text x="100" y="183" fill="#1B365D" font-size="13" font-weight="500" font-family="Charter,Georgia,serif" text-anchor="middle">-1</text>
+      </svg>
+    </div>
+  </div>
+
+  <div class="page-num">08</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 10: Modelo armonico vs screened -->
+<section class="slide">
+  <span class="eyebrow">03 &middot; Dos modelos</span>
+  <div class="slide-title">El modelo screened Poisson anade anclaje suave y guia de gradientes al Laplace puro</div>
+
+  <div class="c2">
+    <div>
+      <h3>Modelo armonico (Laplace)</h3>
+      <p>Condicion Dirichlet dura en los pixeles conocidos:</p>
+      <pre><code>u[i*factor, j*factor] = f[i,j]
+
+Interior: Delta u = 0
+4u[i,j] - u_N - u_S - u_E - u_O = 0</code></pre>
+      <p>La superficie resultante minimiza <code>||grad u||^2</code>: es la mas plana posible.</p>
+    </div>
+    <div>
+      <h3>Screened Poisson (el que usa RZI)</h3>
+      <p>Anclaje suave con peso lambda + guia de gradientes v':</p>
+      <pre><code>E(u) = lam*SUM(u-f)^2
+     + SUM||grad u - v'||^2
+
+EDP resultante (Euler-Lagrange):
+(4 + lam_map)*u[i,j]
+  - u_N - u_S - u_E - u_O = b</code></pre>
+      <p>El anclaje suave permite que la imagen siga los bordes de la guia.</p>
+    </div>
+  </div>
+
+  <div class="page-num">09</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 11: Euler-Lagrange y el sistema lineal -->
+<section class="slide">
+  <span class="eyebrow">03 &middot; Sistema lineal</span>
+  <div class="slide-title">Derivar el funcional e igualar a cero produce el sistema lineal que resuelve el solver</div>
+
+  <div class="c2">
+    <div>
+      <h3>El funcional de energia</h3>
+      <pre><code>E(u) = lam * SUM_{muestras}(u-f)^2
+     + SUM_{todos}||grad u - v'||^2</code></pre>
+      <p><strong>Euler-Lagrange:</strong> la condicion dE/du = 0 da, para cada pixel (i,j):</p>
+      <pre><code>(4 + lam_map[i,j])*u[i,j]
+  - u[i-1,j] - u[i+1,j]
+  - u[i,j-1] - u[i,j+1]
+  = b[i,j]</code></pre>
+    </div>
+    <div>
+      <h3>Los terminos</h3>
+      <pre><code># lam_map: anclaje en muestras
+lam_map[i,j] = lam   # si (i,j) conocido
+lam_map[i,j] = 0     # resto
+
+# b: termino fuente
+b[i,j] = -div(v')[i,j]
+        + lam_map[i,j]*f[i,j]</code></pre>
+      <p>El sistema es <strong>diagonalmente dominante</strong>: la diagonal <code>(4 + lam_map)</code> supera siempre la suma de los coeficientes fuera de diagonal (cuatro veces -1).</p>
+    </div>
+  </div>
+
+  <div class="page-num">10</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 12: Amplificacion de gradientes -->
+<section class="slide">
+  <span class="eyebrow">03 &middot; Guia de gradientes</span>
+  <div class="slide-title">La amplificacion adaptativa refuerza bordes reales sin amplificar ruido de la guia bicubica</div>
+
+  <div class="c2">
+    <div>
+      <p>La guia G es la bicubica del tile. Sus gradientes <code>v = grad G</code> apuntan en la direccion de cada borde.</p>
+      <p>Pero la bicubica suaviza: los gradientes son mas debiles de lo real. La funcion <code>s(t)</code> los amplifica selectivamente:</p>
+      <pre><code>s(t) = 1 + (beta - 1) * t / (t + tau)
+
+v'[i,j] = s(||v[i,j]||) * v[i,j]</code></pre>
+    </div>
+    <div>
+      <h3>Por que funciona</h3>
+      <table>
+        <thead><tr><th>Condicion</th><th>Resultado</th></tr></thead>
+        <tbody>
+          <tr><td><code>||v|| >> tau</code><br>(borde real)</td><td>s(t) -> beta<br>gradiente amplificado</td></tr>
+          <tr><td><code>||v|| &lt;&lt; tau</code><br>(zona plana)</td><td>s(t) -> 1<br>sin cambio</td></tr>
+        </tbody>
+      </table>
+      <p style="margin-top:6pt;">beta tipico: 1.6 a 1.8 &nbsp; tau tipico: 0.02</p>
+    </div>
+  </div>
+
+  <div class="page-num">11</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 13: SECCION 4 -->
+<section class="slide section-break">
+  <div class="sec-num">Parte 04</div>
+  <div class="sec-title">El solver:<br>SOR Red-Black<br>+ Numba</div>
+  <div class="page-num">12</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 14: SOR -->
+<section class="slide">
+  <span class="eyebrow">04 &middot; El solver iterativo</span>
+  <div class="slide-title">SOR supera a Gauss-Seidel usando un factor de relajacion omega mayor que 1</div>
+
+  <div class="c2">
+    <div>
+      <h3>Actualizacion SOR</h3>
+      <pre><code>diag = 4 + lam_map[i,j]
+
+u_gs = (u[i-1,j] + u[i+1,j]
+      + u[i,j-1] + u[i,j+1]
+      + b[i,j]) / diag
+
+# SOR: paso mas largo
+u[i,j] += omega * (u_gs - u[i,j])</code></pre>
+      <p>Con omega = 1 es Gauss-Seidel. Con omega &gt; 1 el metodo salta mas lejos en cada iteracion y converge mas rapido.</p>
+    </div>
+    <div>
+      <h3>omega optimo</h3>
+      <p>Para Laplace en malla N x N con borde Dirichlet:</p>
+      <pre><code>rho_J = cos(pi / (N+1))
+omega = 2 / (1 + sin(pi/(N+1)))</code></pre>
+      <p>Para screened Poisson (diagonal mayor):</p>
+      <pre><code>rho_J = 4/(4+lam) * cos(pi/(N+1))
+omega = 2 / (1 + sqrt(1 - rho_J^2))</code></pre>
+      <p>Si omega pasa del optimo, el metodo diverge.</p>
+    </div>
+  </div>
+
+  <div class="page-num">13</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 15: Barrido omega -->
+<section class="slide">
+  <span class="eyebrow">04 &middot; Omega empirico</span>
+  <div class="slide-title">Con restricciones interiores, el omega optimo empirico (1.52) difiere mucho del teorico (1.95)</div>
+
+  <figure style="flex:1;">
+    <img src="../assets/barrido_omega.png" alt="Curva iteraciones vs omega">
+    <figcaption>Barrido empirico. El minimo (linea verde punteada) esta en 1.52, no en 1.95. Las restricciones interiores (pixeles conocidos cada "factor" posiciones en la malla) modifican el radio espectral efectivo. Usar 1.95 aumenta las iteraciones y acerca el solver a la divergencia.</figcaption>
+  </figure>
+
+  <div class="page-num">14</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 16: Convergencia -->
+<section class="slide">
+  <span class="eyebrow">04 &middot; Convergencia</span>
+  <div class="slide-title">El residuo L2 cae cuatro ordenes de magnitud en 325 iteraciones con decaimiento lineal en escala log</div>
+
+  <figure style="flex:1;">
+    <img src="../assets/convergencia.png" alt="Decaimiento del residuo">
+    <figcaption>Curva de convergencia del solver SOR Red-Black (omega = 1.95, modelo armonico). El patron oscilante de alta frecuencia es tipico del barrido Red-Black: los rojos y negros se alternan. La trayectoria general es estrictamente decreciente.</figcaption>
+  </figure>
+
+  <div class="page-num">15</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 17: Red-Black -->
+<section class="slide">
+  <span class="eyebrow">04 &middot; Ordenamiento Red-Black</span>
+  <div class="slide-title">El patron de tablero rompe dependencias de Gauss-Seidel y habilita paralelismo con prange</div>
+
+  <div class="c2">
+    <div>
+      <p>Un pixel rojo <code>(i+j) par</code> tiene solo vecinos negros. Entonces se pueden actualizar todos los rojos a la vez sin condicion de carrera.</p>
+      <pre><code>@njit(cache=True, parallel=True)
+def kernel_sor_rb(u, b, lam_map, omega, red):
+    h, w = u.shape
+    for i in prange(1, h-1):   # paralelo
+        for j in range(1, w-1):
+            if (i+j) % 2 != red:
+                continue
+            diag = 4.0 + lam_map[i,j]
+            u_gs = (u[i-1,j]+u[i+1,j]+
+                    u[i,j-1]+u[i,j+1]+
+                    b[i,j]) / diag
+            u[i,j] += omega*(u_gs-u[i,j])</code></pre>
+    </div>
+    <div style="display:flex;align-items:center;justify-content:center;">
+      <svg viewBox="0 0 236 236" xmlns="http://www.w3.org/2000/svg" style="width:190px;height:auto;">
+        <rect width="100%" height="100%" fill="#f5f4ed"/>
+        <!-- 4x4, cellsize=52, gap=4, start=8 -->
+        <rect x="8"   y="8"   width="52" height="52" rx="3" fill="#EEF2F7" stroke="#1B365D" stroke-width="1.5"/>
+        <rect x="64"  y="8"   width="52" height="52" rx="3" fill="#3d3d3a" stroke="#141413" stroke-width="1"/>
+        <rect x="120" y="8"   width="52" height="52" rx="3" fill="#EEF2F7" stroke="#1B365D" stroke-width="1.5"/>
+        <rect x="176" y="8"   width="52" height="52" rx="3" fill="#3d3d3a" stroke="#141413" stroke-width="1"/>
+        <rect x="8"   y="64"  width="52" height="52" rx="3" fill="#3d3d3a" stroke="#141413" stroke-width="1"/>
+        <rect x="64"  y="64"  width="52" height="52" rx="3" fill="#EEF2F7" stroke="#1B365D" stroke-width="1.5"/>
+        <rect x="120" y="64"  width="52" height="52" rx="3" fill="#3d3d3a" stroke="#141413" stroke-width="1"/>
+        <rect x="176" y="64"  width="52" height="52" rx="3" fill="#EEF2F7" stroke="#1B365D" stroke-width="1.5"/>
+        <rect x="8"   y="120" width="52" height="52" rx="3" fill="#EEF2F7" stroke="#1B365D" stroke-width="1.5"/>
+        <rect x="64"  y="120" width="52" height="52" rx="3" fill="#3d3d3a" stroke="#141413" stroke-width="1"/>
+        <rect x="120" y="120" width="52" height="52" rx="3" fill="#EEF2F7" stroke="#1B365D" stroke-width="1.5"/>
+        <rect x="176" y="120" width="52" height="52" rx="3" fill="#3d3d3a" stroke="#141413" stroke-width="1"/>
+        <rect x="8"   y="176" width="52" height="52" rx="3" fill="#3d3d3a" stroke="#141413" stroke-width="1"/>
+        <rect x="64"  y="176" width="52" height="52" rx="3" fill="#EEF2F7" stroke="#1B365D" stroke-width="1.5"/>
+        <rect x="120" y="176" width="52" height="52" rx="3" fill="#3d3d3a" stroke="#141413" stroke-width="1"/>
+        <rect x="176" y="176" width="52" height="52" rx="3" fill="#EEF2F7" stroke="#1B365D" stroke-width="1.5"/>
+        <!-- Labels -->
+        <text x="34" y="38" fill="#1B365D" font-size="7.5" font-family="'JetBrains Mono',monospace" text-anchor="middle">i+j=0</text>
+        <text x="34" y="50" fill="#1B365D" font-size="9" font-weight="500" font-family="Charter,Georgia,serif" text-anchor="middle">ROJO</text>
+        <text x="90" y="38" fill="#b0aea5" font-size="7.5" font-family="'JetBrains Mono',monospace" text-anchor="middle">i+j=1</text>
+        <text x="90" y="50" fill="#faf9f5" font-size="9" font-weight="500" font-family="Charter,Georgia,serif" text-anchor="middle">NEGRO</text>
+      </svg>
+    </div>
+  </div>
+
+  <div class="page-num">16</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 18: Benchmark Numba -->
+<section class="slide">
+  <span class="eyebrow">04 &middot; Rendimiento</span>
+  <div class="slide-title">Numba @njit acelera el solver 380 a 444 veces respecto a Python puro</div>
+
+  <div class="c2">
+    <figure style="flex:1;display:flex;flex-direction:column;justify-content:center;">
+      <img src="../assets/benchmark.png" alt="Python vs Numba">
+      <figcaption>Python puro (naranja) vs Numba @njit (azul, casi invisible). 100 iteraciones. La barra azul existe pero es imperceptible a esta escala.</figcaption>
+    </figure>
+    <div>
+      <h3>Por que es tan rapido</h3>
+      <ul>
+        <li>Compilacion a codigo de maquina nativo (LLVM) en el primer llamado.</li>
+        <li>Sin overhead del interprete Python en el bucle interno.</li>
+        <li><code>prange</code> distribuye el bucle externo en multiples nucleos del CPU.</li>
+        <li><code>fastmath=True</code> habilita reordenamientos de punto flotante para mayor velocidad.</li>
+      </ul>
+      <div class="metric-row" style="grid-template-columns:1fr 1fr 1fr;margin-top:8pt;">
+        <div class="metric-card"><span class="metric-value">380x</span><span class="metric-label">32x32</span></div>
+        <div class="metric-card"><span class="metric-value">444x</span><span class="metric-label">64x64</span></div>
+        <div class="metric-card"><span class="metric-value">435x</span><span class="metric-label">96x96</span></div>
+      </div>
+    </div>
+  </div>
+
+  <div class="page-num">17</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 19: SECCION 5 -->
+<section class="slide section-break">
+  <div class="sec-num">Parte 05</div>
+  <div class="sec-title">Pipeline completo<br>de reconstruccion</div>
+  <div class="page-num">18</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 20: Cascada multiescala -->
+<section class="slide">
+  <span class="eyebrow">05 &middot; Cascada multiescala</span>
+  <div class="slide-title">Dividir el factor en etapas pequenas reduce las iteraciones y mejora la calidad</div>
+
+  <div class="c2">
+    <div>
+      <p>Un salto directo de factor 12 parte de una solucion inicial muy lejana a la respuesta. La cascada descompone el factor en etapas:</p>
+      <pre><code>12 = [2, 2, 3]
+ 8 = [2, 2, 2]
+ 6 = [2, 3]
+ 4 = [2, 2]</code></pre>
+      <p>Cada etapa recibe como solucion inicial la salida de la etapa anterior (warm start). El solver necesita muchas menos iteraciones porque parte cerca de la solucion.</p>
+    </div>
+    <div style="display:flex;align-items:center;justify-content:center;">
+      <svg viewBox="0 0 260 200" xmlns="http://www.w3.org/2000/svg" style="width:220px;height:auto;">
+        <defs>
+          <marker id="a20" markerWidth="7" markerHeight="5" refX="6" refY="2.5" orient="auto">
+            <polygon points="0 0,7 2.5,0 5" fill="#1B365D"/>
+          </marker>
+        </defs>
+        <rect width="100%" height="100%" fill="#f5f4ed"/>
+        <!-- LR -->
+        <rect x="8" y="80" width="52" height="40" rx="4" fill="#faf9f5" stroke="#141413" stroke-width="1"/>
+        <text x="34" y="98" fill="#504e49" font-size="7" font-family="'JetBrains Mono',monospace" text-anchor="middle">tile LR</text>
+        <text x="34" y="112" fill="#141413" font-size="9" font-weight="500" font-family="Charter,Georgia,serif" text-anchor="middle">64x64</text>
+        <!-- arrow -->
+        <line x1="60" y1="100" x2="76" y2="100" stroke="#1B365D" stroke-width="1.2" marker-end="url(#a20)"/>
+        <text x="68" y="94" fill="#1B365D" font-size="7" font-family="'JetBrains Mono',monospace" text-anchor="middle">x2</text>
+        <!-- Etapa 1 -->
+        <rect x="76" y="68" width="52" height="64" rx="4" fill="#EEF2F7" stroke="#1B365D" stroke-width="1.5"/>
+        <text x="102" y="90" fill="#1B365D" font-size="7" font-family="'JetBrains Mono',monospace" text-anchor="middle">SOR</text>
+        <text x="102" y="106" fill="#141413" font-size="9" font-weight="500" font-family="Charter,Georgia,serif" text-anchor="middle">127x127</text>
+        <text x="102" y="122" fill="#504e49" font-size="7" font-family="'JetBrains Mono',monospace" text-anchor="middle">etapa 1</text>
+        <!-- arrow -->
+        <line x1="128" y1="100" x2="144" y2="100" stroke="#1B365D" stroke-width="1.2" marker-end="url(#a20)"/>
+        <text x="136" y="94" fill="#1B365D" font-size="7" font-family="'JetBrains Mono',monospace" text-anchor="middle">x2</text>
+        <!-- Etapa 2 -->
+        <rect x="144" y="56" width="52" height="88" rx="4" fill="#EEF2F7" stroke="#1B365D" stroke-width="1.5"/>
+        <text x="170" y="82" fill="#1B365D" font-size="7" font-family="'JetBrains Mono',monospace" text-anchor="middle">SOR</text>
+        <text x="170" y="98" fill="#141413" font-size="9" font-weight="500" font-family="Charter,Georgia,serif" text-anchor="middle">253x253</text>
+        <text x="170" y="114" fill="#504e49" font-size="7" font-family="'JetBrains Mono',monospace" text-anchor="middle">etapa 2</text>
+        <text x="170" y="128" fill="#504e49" font-size="6.5" font-family="'JetBrains Mono',monospace" text-anchor="middle">warm start</text>
+        <text x="170" y="140" fill="#504e49" font-size="6.5" font-family="'JetBrains Mono',monospace" text-anchor="middle">desde eta.1</text>
+        <!-- arrow -->
+        <line x1="196" y1="100" x2="210" y2="100" stroke="#1B365D" stroke-width="1.2" marker-end="url(#a20)"/>
+        <text x="203" y="94" fill="#1B365D" font-size="7" font-family="'JetBrains Mono',monospace" text-anchor="middle">x3</text>
+        <!-- Salida -->
+        <rect x="210" y="44" width="46" height="112" rx="4" fill="#faf9f5" stroke="#504e49" stroke-width="1"/>
+        <text x="233" y="86" fill="#504e49" font-size="7" font-family="'JetBrains Mono',monospace" text-anchor="middle">HR</text>
+        <text x="233" y="100" fill="#141413" font-size="8" font-weight="500" font-family="Charter,Georgia,serif" text-anchor="middle">757x757</text>
+        <text x="233" y="115" fill="#504e49" font-size="6.5" font-family="Charter,Georgia,serif" text-anchor="middle">(64-1)*12+1</text>
+        <!-- Etiqueta factor -->
+        <text x="130" y="28" fill="#1B365D" font-size="8" font-family="'JetBrains Mono',monospace" text-anchor="middle" letter-spacing="0.1em">FACTOR 12 = [2,2,3]</text>
+      </svg>
+    </div>
+  </div>
+
+  <div class="page-num">19</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 21: Back-projection y Finishing -->
+<section class="slide">
+  <span class="eyebrow">05 &middot; Post-procesamiento</span>
+  <div class="slide-title">Back-projection corrige la consistencia con el original; el stack de acabado mejora la apariencia visual</div>
+
+  <div class="c2">
+    <div>
+      <h3>Back-projection</h3>
+      <pre><code>for _ in range(n_pass=2):
+    err = f_lr - Down(u)     # error LR
+    u = u + gain * Up(err)   # corregir HR
+# gain default: 0.6</code></pre>
+      <h3>Anti-ringing</h3>
+      <pre><code>u[i,j] = clip(u[i,j],
+  local_min_3x3(G),
+  local_max_3x3(G))   # G = guia bicubica</code></pre>
+    </div>
+    <div>
+      <h3>Stack finalizar_display</h3>
+      <ol>
+        <li>Resize LANCZOS al tamano exacto (tw*factor, th*factor)</li>
+        <li>Difusion Perona-Malik (5 iters, kappa=0.03) -- suaviza ruido en zonas planas</li>
+        <li>Shock filter Osher-Rudin (3 iters) -- afila rampas borrosas</li>
+        <li>USM opcional (60% default) -- realce adicional</li>
+        <li>Anti-ringing final -- elimina halos del USM</li>
+      </ol>
+    </div>
+  </div>
+
+  <div class="page-num">20</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 22: Color YCbCr -->
+<section class="slide">
+  <span class="eyebrow">05 &middot; Soporte de color</span>
+  <div class="slide-title">La EDP se resuelve solo en luminancia Y; la crominancia Cb/Cr escala por bicubica</div>
+
+  <div class="c2">
+    <div>
+      <h3>Conversion BT.601</h3>
+      <pre><code>Y  = 0.299*R + 0.587*G + 0.114*B
+Cb = -0.169*R - 0.331*G + 0.5*B + 0.5
+Cr = 0.5*R - 0.419*G - 0.081*B + 0.5</code></pre>
+      <p>El ojo humano percibe el 85% del detalle a traves de Y. Resolver la EDP solo sobre Y reduce el tiempo de calculo a una tercera parte.</p>
+    </div>
+    <div>
+      <h3>Pipeline de color</h3>
+      <ol>
+        <li>Convertir RGB -> YCbCr</li>
+        <li>Resolver EDP sobre Y_lr -> Y_hr (pipeline completo)</li>
+        <li>Escalar Cb_lr, Cr_lr a alta resolucion con bicubica</li>
+        <li>Recombinar Y_hr + Cb_hr + Cr_hr -> RGB</li>
+      </ol>
+      <p>El resultado conserva colores correctos y tiene la nitidez del solver en los bordes.</p>
+    </div>
+  </div>
+
+  <div class="page-num">21</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 23: Demo visual -->
+<section class="slide">
+  <span class="eyebrow">05 &middot; Resultado visual</span>
+  <div class="slide-title">Los bordes del solver son notablemente mas nitidos que la bicubica en zonas con textura</div>
+
+  <figure style="flex:1;">
+    <img src="../assets/upscaling_demo.png" alt="Comparacion visual">
+    <figcaption>Izquierda: bicubica. Centro: Poisson screened sin amplificacion de gradientes (beta=1). Derecha: con beta=1.7 y shock filter. Los bordes en la version derecha son mas escarpados; el detalle de textura es mas pronunciado. Las tres imagenes tienen el mismo factor de upscaling.</figcaption>
+  </figure>
+
+  <div class="page-num">22</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 24: SECCION 6 -->
+<section class="slide section-break">
+  <div class="sec-num">Parte 06</div>
+  <div class="sec-title">Metricas<br>y resultados</div>
+  <div class="page-num">23</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 25: Metricas -->
+<section class="slide">
+  <span class="eyebrow">06 &middot; Metricas de calidad</span>
+  <div class="slide-title">PSNR, SSIM y GMSD miden dimensiones distintas de calidad; ninguna es suficiente sola</div>
+
+  <table>
+    <thead><tr><th>Metrica</th><th>Formula</th><th>Mejor valor</th><th>Que mide</th></tr></thead>
+    <tbody>
+      <tr>
+        <td><strong>PSNR</strong></td>
+        <td><code>10*log10(1/MSE)</code></td>
+        <td>Mayor (dB)</td>
+        <td>Error cuadratico total en escala log. Sensible a ruido uniforme.</td>
+      </tr>
+      <tr>
+        <td><strong>SSIM</strong></td>
+        <td>Compara mu, sigma, correlacion local</td>
+        <td>Mayor (max 1)</td>
+        <td>Percepcion estructural: luminancia, contraste, textura local.</td>
+      </tr>
+      <tr>
+        <td><strong>GMSD</strong></td>
+        <td>std(GMS[i,j]) con filtro Prewitt</td>
+        <td>Menor (min 0)</td>
+        <td>Variabilidad de la similitud de gradientes. Detecta ringing y artefactos locales.</td>
+      </tr>
+    </tbody>
+  </table>
+
+  <p style="margin-top:6pt;"><strong>Interpretacion practica:</strong> PSNR alto + SSIM alto + GMSD bajo = imagen fiel, nitida y sin artefactos. Una reconstruccion puede tener PSNR aceptable pero GMSD alto si introduce halos cerca de bordes.</p>
+
+  <div class="page-num">24</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 26: Hallazgos -->
+<section class="slide">
+  <span class="eyebrow">06 &middot; Hallazgos experimentales</span>
+  <div class="slide-title">Laplace supera a Poisson screened con submuestreo fuerte; el omega teorico no aplica con restricciones interiores</div>
+
+  <div class="c2">
+    <div>
+      <h3>Hallazgo 1: Laplace gana con factor 4</h3>
+      <table>
+        <thead><tr><th>Metodo</th><th>PSNR</th><th>SSIM</th></tr></thead>
+        <tbody>
+          <tr><td>Bicubica</td><td>23.12 dB</td><td>0.81</td></tr>
+          <tr><td>Laplace puro</td><td><strong>24.50 dB</strong></td><td><strong>0.84</strong></td></tr>
+          <tr><td>Screened Poisson</td><td>21.70 dB</td><td>0.79</td></tr>
+        </tbody>
+      </table>
+      <p style="font-size:9pt;margin-top:4pt;color:var(--olive);">Con solo el 6.25% de pixeles conocidos, los gradientes de la guia bicubica son ruidosos. El error en <code>b</code> degrada la solucion screened.</p>
+    </div>
+    <div>
+      <h3>Hallazgo 2: omega empirico = 1.52</h3>
+      <p>La formula teorica <code>2/(1+sin(pi/(N+1)))</code> asume borde Dirichlet puro. Los pixeles conocidos en el interior modifican el radio espectral.</p>
+      <h3>Hallazgo 3: Numba 380-444x</h3>
+      <p>La aceleracion se mantiene estable al escalar la malla, lo que confirma que el cuello de botella es el bucle interno, no la comunicacion entre hilos.</p>
+    </div>
+  </div>
+
+  <div class="page-num">25</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 27: Casos de uso -->
+<section class="slide">
+  <span class="eyebrow">07 &middot; Casos de uso</span>
+  <div class="slide-title">RZI sirve en tareas reales donde importa una region pequena, critica y visualmente delicada</div>
+
+  <p class="lead">El valor del proyecto aparece cuando el usuario no quiere reescalar toda la imagen, sino reconstruir un area puntual con mas nitidez, mejor borde y menos artefactos que una interpolacion generica.</p>
+
+  <div class="c2" style="flex:1;">
+    <div>
+      <h3>Casos muy concretos</h3>
+      <ul>
+        <li><strong>Fotografia antigua:</strong> ampliar rostros, firmas o sellos en documentos escaneados.</li>
+        <li><strong>Archivistica:</strong> reescalar numeraciones, timbres y notas manuscritas fotografiadas con celular.</li>
+        <li><strong>Forense visual:</strong> reconstruir una placa, letrero o matricula tomada desde lejos.</li>
+        <li><strong>Vigilancia:</strong> ampliar la cara, manos o un objeto dentro de un frame de baja resolucion.</li>
+        <li><strong>Microscopia:</strong> reforzar contornos de celulas, tejido o colonias antes de una revision manual.</li>
+        <li><strong>Medicina:</strong> mejorar una region de interes en radiografias, ecografias o microscans.</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Casos de alto valor tecnico</h3>
+      <ul>
+        <li><strong>Astronomia aficionada:</strong> ampliar la luna, manchas solares o detalles planetarios capturados con teleobjetivo limitado.</li>
+        <li><strong>Cartografia:</strong> reforzar nombres de vias, simbolos o etiquetas muy pequenas en mapas escaneados.</li>
+        <li><strong>Inspeccion industrial:</strong> ampliar tornillos, fisuras, soldaduras o numeros de serie en mantenimiento.</li>
+        <li><strong>Drones:</strong> revisar azoteas, cableado o puntos de interes detectados en una inspeccion aerea.</li>
+        <li><strong>Educacion:</strong> demostrar Laplace, Poisson y SOR sobre la misma region con una GUI interactiva.</li>
+        <li><strong>Contenido visual:</strong> preparar miniaturas, afiches o recortes donde solo importa un centro bien definido.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="callout">RZI es mas fuerte como herramienta de reconstruccion focalizada que como ampliador general: funciona mejor cuando ya existe contexto y solo falta recuperar detalle local en una region especifica.</div>
+
+  <div class="page-num">26</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+<!-- Slide 28: Cierre -->
+<section class="slide">
+  <span class="eyebrow">Cierre</span>
+  <div class="slide-title">RZI demuestra que resolver una EDP produce bordes mas nitidos que la interpolacion, al costo de implementar SOR con cuidado</div>
+
+  <div class="c2">
+    <div>
+      <h3>Lo que funciona</h3>
+      <ul>
+        <li>Screened Poisson con gradientes amplificados supera a la bicubica en imagenes con bordes claros y factor moderado (2-3).</li>
+        <li>La cascada multiescala reduce drasticamente las iteraciones necesarias.</li>
+        <li>Numba @njit hace el solver practico para uso interactivo.</li>
+        <li>Back-projection y anti-ringing mejoran la fidelidad sin introducir artefactos.</li>
+      </ul>
+    </div>
+    <div>
+      <h3>Lo que hay que saber</h3>
+      <ul>
+        <li>Con submuestreo muy fuerte (factor 4+), el vector b ruidoso perjudica al screened Poisson.</li>
+        <li>El omega optimo teorico no aplica con restricciones interiores: el barrido empirico da el valor real.</li>
+        <li>La super-resolucion no recupera informacion: crea estimaciones plausibles basadas en la guia.</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="bottom-line">El proyecto RZI implementa la teoria y la pone en practica en una GUI interactiva con metricas de calidad, animacion de convergencia y benchmark de rendimiento.</div>
+  <div class="page-num">27</div>
+  <div class="footer-mark">RZI</div>
+</section>
+
+</body>
+</html>

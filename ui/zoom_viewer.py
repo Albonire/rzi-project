@@ -32,6 +32,8 @@ class VisorImagen(QGraphicsView):
         self._sel_inicio  = None
         self._sel_rect    = None   # QGraphicsRectItem visible mientras se dibuja
 
+        self._marcas      = []     # lista de QGraphicsRectItem para region e inset
+
         self.setMouseTracking(True)
         self.setScene(self._escena)
         self.setRenderHint(QPainter.Antialiasing)
@@ -64,6 +66,7 @@ class VisorImagen(QGraphicsView):
         pixmap = QPixmap.fromImage(qimg.copy())
         self._escena.clear()
         self._sel_rect    = None
+        self._marcas      = []
         self._pixmap_item = self._escena.addPixmap(pixmap)
         self._escena.setSceneRect(QRectF(pixmap.rect()))
         self.ajustar_a_ventana()
@@ -71,6 +74,7 @@ class VisorImagen(QGraphicsView):
     def limpiar(self) -> None:
         self._escena.clear()
         self._pixmap_item = None
+        self._marcas      = []
         self._zoom        = 1.0
 
     def ajustar_a_ventana(self) -> None:
@@ -119,6 +123,38 @@ class VisorImagen(QGraphicsView):
         self.setTransform(otro.transform())
         self.horizontalScrollBar().setValue(otro.horizontalScrollBar().value())
         self.verticalScrollBar().setValue(otro.verticalScrollBar().value())
+
+    def enfocar_region(self, x: int, y: int, w: int, h: int,
+                       margen: float = 0.12) -> None:
+        """
+        encuadra el viewport en la region indicada (coordenadas de imagen)
+        con un margen proporcional. llamar despues de establecer_imagen.
+        """
+        if self._pixmap_item is None:
+            return
+        mx = w * margen
+        my = h * margen
+        self.fitInView(
+            QRectF(x - mx, y - my, w + 2 * mx, h + 2 * my),
+            Qt.KeepAspectRatio,
+        )
+        self._zoom = self.transform().m11()
+
+    def marcar_region(self, x: int, y: int, w: int, h: int,
+                      color: str = '#FF5252') -> None:
+        """
+        dibuja un recuadro permanente sobre la region indicada
+        (coordenadas de imagen). el grosor es cosmetico (constante con el
+        zoom). se pueden acumular varios recuadros (region + inset); todos
+        se borran automaticamente en la siguiente llamada a establecer_imagen.
+        llamar despues de establecer_imagen.
+        """
+        if self._pixmap_item is None:
+            return
+        pen = QPen(QColor(color), 2)
+        pen.setCosmetic(True)
+        item = self._escena.addRect(QRectF(x, y, w, h), pen)
+        self._marcas.append(item)
 
     # zoom con rueda
 

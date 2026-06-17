@@ -1302,6 +1302,71 @@ class VentanaPrincipal(QMainWindow):
 
     # reconstruccion poisson sor
 
+    # fraccion del lado menor de la imagen que ocupa el inset (~40 %)
+    INSET_FRAC = 0.40
+
+    def _componer_con_inset(self, patch: np.ndarray,
+                             region: tuple) -> tuple:
+        """
+        Construye el contexto del panel derecho: copia de la imagen original
+        A SU TAMANO REAL con el tile reconstruido pegado como INSET en la
+        esquina mas lejana a la region del zoom.
+
+        La region original NO se modifica (el usuario ve donde se trabajo).
+        El inset muestra el tile SR a un tamano de INSET_FRAC * dimension
+        de la imagen (preservando aspecto), con un margen de 2% respecto
+        al borde.
+
+        Devuelve (contexto, region_orig, region_inset) donde:
+          - contexto:      ndarray float64 con original + inset pegado
+          - region_orig:   (tx, ty, tw, th) en coords de imagen (para recuadro rojo)
+          - region_inset:  (ix, iy, iw, ih) en coords de imagen (para recuadro verde)
+        """
+        tx, ty, tw, th = region
+        orig = (self._imagen_color if self._imagen_color is not None
+                else self._imagen_orig)
+        H, W = orig.shape[:2]
+
+        # clamp de la region a los limites de la imagen
+        tx = max(0, min(tx, W - 1))
+        ty = max(0, min(ty, H - 1))
+        tw = max(1, min(tw, W - tx))
+        th = max(1, min(th, H - ty))
+
+        # tamano del inset preservando el aspecto del patch
+        ph, pw = patch.shape[:2]
+        aspect = pw / max(ph, 1)
+        ih = max(1, round(self.INSET_FRAC * H))
+        iw = max(1, round(ih * aspect))
+        if iw > self.INSET_FRAC * W:
+            iw = max(1, round(self.INSET_FRAC * W))
+            ih = max(1, round(iw / aspect))
+
+        # esquina mas lejana al centro de la region
+        cx = tx + tw / 2
+        cy = ty + th / 2
+        m  = max(2, round(0.02 * min(W, H)))
+        corners = {
+            'TL': (m,         m),
+            'TR': (W - iw - m, m),
+            'BL': (m,         H - ih - m),
+            'BR': (W - iw - m, H - ih - m),
+        }
+        ix, iy = max(corners.items(),
+                     key=lambda kv: (kv[1][0] - cx) ** 2 + (kv[1][1] - cy) ** 2)[1]
+        ix = int(max(0, min(ix, W - iw)))
+        iy = int(max(0, min(iy, H - ih)))
+
+        # pegar el inset
+        base = orig.copy()
+        if patch.ndim == 3:
+            patch_inset = resize_rgb_float(patch, iw, ih, Image.LANCZOS)
+        else:
+            patch_inset = resize_float(patch, iw, ih, Image.LANCZOS)
+        base[iy:iy + ih, ix:ix + iw] = np.clip(patch_inset, 0.0, 1.0)
+
+        return base, (tx, ty, tw, th), (ix, iy, iw, ih)
+
     def _reconstruir(self):
         info = self._tile_desde_viewport()
         if info is None:
@@ -1351,20 +1416,29 @@ class VentanaPrincipal(QMainWindow):
         res    = datos['resultado']
         factor = datos['factor']
 
-        # imagen ampliada real (misma que el dialogo de detalle): el visor
-        # izquierdo sigue mostrando la region original (zoom nativo) y el
-        # derecho la ampliacion suave del modelo screened, sin embed/reduccion
-        self.visor_recon.establecer_imagen(datos['imagen_upscale'])
+        # componer: imagen original a tamano real + inset con la reconstruccion
+        # en la esquina mas lejana a la region del zoom. el visor derecho muestra
+        # ese contexto con:
+        #   recuadro ROJO  -> ubicacion de la region del zoom en el original
+        #   recuadro VERDE -> inset con el tile reconstruido a detalle completo
+        # el tile SR full-res (tw*factor x th*factor) se guarda con 'Guardar imagen'.
+        contexto, region, inset = self._componer_con_inset(
+            datos['imagen_upscale'], datos['region'])
+        datos['imagen_contexto'] = contexto
+        self.visor_recon.establecer_imagen(contexto)
+        self.visor_recon.marcar_region(*region, color='#FF5252')   # rojo: donde se trabajo
+        self.visor_recon.marcar_region(*inset,  color='#00E676')   # verde: inset SR
 
         self.panel_res.mostrar_convergencia(res['historial'], res['omega'])
 
         tx, ty, tw, th = datos['region']
         nh, nw = datos['forma_salida']
+        ix, iy, iw, ih = inset
         etapas_txt = 'x'.join(str(e) for e in res.get('etapas', [factor]))
         self.statusBar().showMessage(
             f"Poisson SOR screened x{factor} (etapas {etapas_txt})  |  "
-            f"region ({tx},{ty}) {tw}x{th} px  "
-            f"->  ampliacion {nw}x{nh}  |  "
+            f"region ({tx},{ty}) {tw}x{th} px -> SR {nw}x{nh}  |  "
+            f"inset en ({ix},{iy}) {iw}x{ih}  |  "
             f"iter={res['iteraciones']}  t={res['tiempo']:.3f}s  "
             f"omega={res['omega']:.4f}  "
             f"conv={'Si' if res['convergio'] else 'No (aumentar max_iter)'}")
@@ -1583,8 +1657,10 @@ class VentanaPrincipal(QMainWindow):
             return
 
         img = None
-        # Busqueda explicita para evitar evaluar arrays de NumPy como booleanos (ValueError)
-        for clave in ('poisson', 'imagen_upscale', 'imagen_completa'):
+        # Busqueda explicita para evitar evaluar arrays de NumPy como booleanos (ValueError).
+        # 'imagen_upscale' contiene el tile reconstruido a resolucion completa
+        # (tw*factor x th*factor), que es el resultado de interes para guardar.
+        for clave in ('imagen_upscale', 'poisson', 'imagen_completa'):
             if clave in self._resultado and self._resultado[clave] is not None:
                 img = self._resultado[clave]
                 break
