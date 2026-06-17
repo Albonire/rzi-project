@@ -40,7 +40,8 @@ from core.poisson_builder import (construir_problema, construir_problema_screene
 from core.sor_solver import (resolver, resolver_screened, barrido_omega as _barrido,
                               benchmark_numba_vs_python, NUMBA_DISPONIBLE,
                               _calentamiento)
-from core.upscaler import upscale_poisson_screened, finalizar_display, finalizar_display_color
+from core.upscaler import (upscale_poisson_screened, finalizar_display,
+                           finalizar_display_color, generar_frames_pipeline)
 from core.image_ops import rgb_a_ycbcr, ycbcr_a_rgb, resize_float, resize_rgb_float
 from services.metrics import (psnr, ssim, interpolacion_bicubica, tabla_comparativa)
 from services.exporter import (guardar_imagen, exportar_csv,
@@ -208,10 +209,12 @@ class PanelParametros(QWidget):
 
         gl.addWidget(QLabel('Factor:'), 0, 0)
         self.spin_factor = QSpinBox()
-        self.spin_factor.setRange(2, 8)
+        self.spin_factor.setRange(2, 12)
         self.spin_factor.setValue(4)
         self.spin_factor.setToolTip(
-            'con factor=4 se conoce 1 de cada 16 pixeles')
+            'factor de upscaling: 2..12 (con factor=4 se conoce 1 de cada 16 '
+            'pixeles). Factores grandes activan mas etapas en la cascada y '
+            'tardan mas; la descomposicion es automatica (ej: x12 -> x2,x2,x3).')
         gl.addWidget(self.spin_factor, 0, 1)
 
         lay.addWidget(g_entrada)
@@ -344,6 +347,19 @@ class PanelParametros(QWidget):
             'zonas planas preservando los bordes')
         scl.addWidget(self.chk_difusion, 7, 1)
 
+        scl.addWidget(QLabel('Intensidad back-projection:'), 8, 0)
+        self.spin_back_gain = QDoubleSpinBox()
+        self.spin_back_gain.setDecimals(2)
+        self.spin_back_gain.setRange(0.0, 1.0)
+        self.spin_back_gain.setValue(0.6)
+        self.spin_back_gain.setSingleStep(0.1)
+        self.spin_back_gain.setToolTip(
+            'gain de back-projection (0.0..1.0): mas alto = mayor fidelidad '
+            'con la imagen original pero mas grano; mas bajo = imagen mas limpia. '
+            'Default 0.6 equilibra fidelidad y ruido.')
+        self.chk_back_projection.toggled.connect(self.spin_back_gain.setEnabled)
+        scl.addWidget(self.spin_back_gain, 8, 1)
+
         lay.addWidget(g_screened)
 
 
@@ -406,6 +422,7 @@ class PanelParametros(QWidget):
             'anti_ringing':     self.chk_anti_ringing.isChecked(),
             'usar_shock':       self.chk_shock.isChecked(),
             'usar_difusion':    self.chk_difusion.isChecked(),
+            'back_gain':        self.spin_back_gain.value(),
         }
 
     def deshabilitar(self, flag: bool):
@@ -940,123 +957,178 @@ class VentanaPrincipal(QMainWindow):
         self.visor_recon.establecer_imagen(imagen_upscaled)
         self.statusBar().showMessage(f'Lupa actualizada: {imagen_upscaled.shape[1]}x{imagen_upscaled.shape[0]} px')
 
-    # animacion de convergencia
+    # animacion didactica del proceso completo de reconstruccion
     def _animar_convergencia(self):
         info = self._tile_desde_viewport()
         if info is None:
             return
 
-        tile = info[0]
+        tile   = info[0]
         params = self.panel_params.obtener_params()
 
         def _tarea_animacion(t=tile, p=params):
             es_color = t.ndim == 3
-            kwargs_realce = dict(
-                usar_difusion=p['usar_difusion'],
-                usar_shock=p['usar_shock'],
-            )
-
             if es_color:
                 y, cb, cr = rgb_a_ycbcr(t)
                 canal = y
             else:
                 canal = t
 
-            res = upscale_poisson_screened(
+            # generar_frames_pipeline orquesta TODO el proceso: NN, bicubica,
+            # SOR por etapa, back-projection, anti-ringing, difusion, shock,
+            # USM y resultado final. El ultimo frame es identico a Reconstruir.
+            gen = generar_frames_pipeline(
                 canal, p['factor'],
                 lam=p['lam'], beta=p['beta'], tau=p['tau'],
                 usar_back_projection=p['back_projection'],
                 usar_anti_ringing=p['anti_ringing'],
                 usar_multiescala=p['multiescala'],
+                usar_difusion=p['usar_difusion'],
+                usar_shock=p['usar_shock'],
+                usm_pct=p['usm_pct'],
                 tol=p['tol'], max_iter=p['max_iter'],
-                capturar_snapshots=True,
+                back_gain=p['back_gain'],
             )
 
-            th, tw = canal.shape
             if es_color:
-                # croma fijo (no participa de la convergencia): se reescala
-                # una sola vez y se recombina con cada snapshot de Y.
-                frames = [finalizar_display_color(s, cb, cr, y, p['factor'],
-                                                    p['usm_pct'], **kwargs_realce)
-                          for s in res['snapshots']]
-                bic = resize_rgb_float(t, tw * p['factor'], th * p['factor'], Image.BICUBIC)
+                # el croma no participa en el pipeline: se reescala con
+                # bicubica una sola vez y se recombina con cada frame 2D de Y.
+                th, tw   = canal.shape
+                out_h    = th * p['factor']
+                out_w    = tw * p['factor']
+                cb_disp  = np.clip(resize_float(cb, out_w, out_h, Image.BICUBIC), 0.0, 1.0)
+                cr_disp  = np.clip(resize_float(cr, out_w, out_h, Image.BICUBIC), 0.0, 1.0)
+                from core.image_ops import ycbcr_a_rgb as _ycbcr_a_rgb
+                frames_vis = [_ycbcr_a_rgb(f, cb_disp, cr_disp)
+                              for f in gen['frames']]
             else:
-                frames = [finalizar_display(s, t, p['factor'], p['usm_pct'], **kwargs_realce)
-                          for s in res['snapshots']]
-                pil_tile = Image.fromarray(
-                    (np.clip(t, 0.0, 1.0) * 255).astype(np.uint8), mode='L')
-                bic = np.array(
-                    pil_tile.resize((tw * p['factor'], th * p['factor']), Image.BICUBIC),
-                    dtype=np.float64) / 255.0
+                frames_vis = gen['frames']
 
             return {
-                'snapshots':   frames,
-                'bicubica':    bic,
-                'iteraciones': res['iteraciones'],
-                'tiempo':      res['tiempo'],
-                'omega':       res['omega'],
-                'etapas':      res['etapas'],
+                'frames':          frames_vis,
+                'pasos':           gen['pasos'],
+                'pasos_de_frame':  gen['pasos_de_frame'],
+                'subtitulos':      gen['subtitulos'],
+                'omega':           gen['omega'],
+                'iteraciones':     gen['iteraciones'],
+                'tiempo':          gen['tiempo'],
+                'etapas':          gen['etapas'],
             }
 
         ok = self._iniciar_hilo(_tarea_animacion)
         if not ok:
             return
 
-        self.statusBar().showMessage('Generando animacion de convergencia...')
+        self.statusBar().showMessage(
+            'Generando animacion del proceso completo de reconstruccion...')
         self._hilo.terminado.connect(self._mostrar_dialogo_animacion)
 
     def _mostrar_dialogo_animacion(self, resultado: dict):
         from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout,
-                                       QPushButton, QLabel, QSlider)
-        from PySide6.QtWidgets import QComboBox
+                                       QPushButton, QLabel, QSlider,
+                                       QComboBox, QListWidget,
+                                       QListWidgetItem, QSizePolicy)
         from PySide6.QtCore import QTimer, Qt
 
-        snapshots = resultado.get('snapshots', [])
-        if not snapshots:
-            QMessageBox.warning(self, 'Error', 'No se generaron snapshots.')
+        frames = resultado.get('frames', [])
+        if not frames:
+            QMessageBox.warning(self, 'Error', 'No se generaron frames.')
             return
 
+        pasos          = resultado['pasos']
+        pasos_de_frame = resultado['pasos_de_frame']
+        subtitulos     = resultado['subtitulos']
+        n_frames       = len(frames)
+        n_pasos        = len(pasos)
+
         dialogo = QDialog(self)
-        dialogo.setWindowTitle('Animacion de Convergencia (modelo screened)')
-        dialogo.resize(1000, 650)
+        dialogo.setWindowTitle('Proceso completo de reconstruccion RZI')
+        dialogo.resize(1150, 680)
         dialogo.setStyleSheet(ESTILO)
 
-        layout = QVBoxLayout(dialogo)
+        root = QVBoxLayout(dialogo)
+        root.setSpacing(6)
 
+        # --- cabecera con metadatos del proceso ---
         etapas_txt = ' -> '.join(f'x{e}' for e in resultado.get('etapas', []))
-        lbl_info = QLabel(f"Frames: {len(snapshots)} | "
-                          f"Cascada: {etapas_txt} | "
-                          f"Omega: {resultado['omega']:.3f} | "
-                          f"Iteraciones totales: {resultado['iteraciones']} | "
-                          f"Tiempo: {resultado['tiempo']:.3f}s")
+        lbl_info = QLabel(
+            f'Frames: {n_frames}  |  Pasos: {n_pasos}  |  '
+            f'Cascada: {etapas_txt}  |  '
+            f'Omega: {resultado["omega"]:.3f}  |  '
+            f'Iters SOR: {resultado["iteraciones"]}  |  '
+            f'Tiempo SOR: {resultado["tiempo"]:.2f}s'
+        )
         lbl_info.setStyleSheet('color: #2196F3; font-weight: bold; padding: 4px;')
-        layout.addWidget(lbl_info)
+        root.addWidget(lbl_info)
 
-        visores_layout = QHBoxLayout()
+        # --- cuerpo: lista de pasos (izquierda) + visor (derecha) ---
+        cuerpo = QHBoxLayout()
+        cuerpo.setSpacing(8)
 
-        col_anim = QVBoxLayout()
-        lbl_anim = QLabel('SOR screened (animado)')
-        lbl_anim.setAlignment(Qt.AlignCenter)
-        lbl_anim.setStyleSheet('color: #B0B0B0;')
-        col_anim.addWidget(lbl_anim)
-        visor_temp = VisorImagen()
-        col_anim.addWidget(visor_temp)
-        visores_layout.addLayout(col_anim)
+        # lista de pasos (esquema del proceso)
+        lista_pasos = QListWidget()
+        lista_pasos.setFixedWidth(240)
+        lista_pasos.setStyleSheet("""
+            QListWidget {
+                background: #252525;
+                border: 1px solid #444;
+                border-radius: 4px;
+                font-size: 11px;
+                color: #C0C0C0;
+            }
+            QListWidget::item { padding: 5px 8px; }
+            QListWidget::item:selected {
+                background: #1565C0;
+                color: #FFFFFF;
+                font-weight: bold;
+            }
+        """)
+        for i, nombre in enumerate(pasos):
+            item = QListWidgetItem(f'{i + 1}. {nombre}')
+            lista_pasos.addItem(item)
+        # el usuario puede hacer click para saltar a ese paso
+        def _saltar_a_paso(row):
+            # buscar el primer frame de ese paso
+            for fi, pi in enumerate(pasos_de_frame):
+                if pi == row:
+                    slider.setValue(fi)
+                    break
+        lista_pasos.currentRowChanged.connect(_saltar_a_paso)
 
-        col_bic = QVBoxLayout()
-        lbl_bic = QLabel('Bicubica (referencia fija)')
-        lbl_bic.setAlignment(Qt.AlignCenter)
-        lbl_bic.setStyleSheet('color: #B0B0B0;')
-        col_bic.addWidget(lbl_bic)
-        visor_bic = VisorImagen()
-        visor_bic.establecer_imagen(resultado['bicubica'])
-        col_bic.addWidget(visor_bic)
-        visores_layout.addLayout(col_bic)
+        col_lista = QVBoxLayout()
+        lbl_lista_titulo = QLabel('Proceso de reconstruccion')
+        lbl_lista_titulo.setAlignment(Qt.AlignCenter)
+        lbl_lista_titulo.setStyleSheet('color: #90A4AE; font-size: 11px; padding-bottom: 2px;')
+        col_lista.addWidget(lbl_lista_titulo)
+        col_lista.addWidget(lista_pasos)
 
-        layout.addLayout(visores_layout)
+        cuerpo.addLayout(col_lista)
 
+        # visor unico (ocupa el resto del espacio)
+        col_visor = QVBoxLayout()
+        lbl_visor_titulo = QLabel('Reconstruccion RZI')
+        lbl_visor_titulo.setAlignment(Qt.AlignCenter)
+        lbl_visor_titulo.setStyleSheet('color: #90A4AE; font-size: 11px; padding-bottom: 2px;')
+        col_visor.addWidget(lbl_visor_titulo)
+        visor = VisorImagen()
+        col_visor.addWidget(visor, stretch=1)
+
+        cuerpo.addLayout(col_visor, stretch=1)
+        root.addLayout(cuerpo, stretch=1)
+
+        # --- leyenda del frame actual ---
+        lbl_leyenda = QLabel('')
+        lbl_leyenda.setWordWrap(True)
+        lbl_leyenda.setAlignment(Qt.AlignCenter)
+        lbl_leyenda.setStyleSheet(
+            'color: #E0E0E0; background: #2A2A2A; border-radius: 4px; '
+            'padding: 6px; font-size: 11px;')
+        lbl_leyenda.setMinimumHeight(44)
+        root.addWidget(lbl_leyenda)
+
+        # --- slider ---
         slider = QSlider(Qt.Horizontal)
-        slider.setRange(0, len(snapshots) - 1)
+        slider.setRange(0, n_frames - 1)
         slider.setValue(0)
         slider.setStyleSheet("""
             QSlider::groove:horizontal {
@@ -1067,74 +1139,97 @@ class VentanaPrincipal(QMainWindow):
                 border-radius: 9px;
             }
         """)
-        layout.addWidget(slider)
+        root.addWidget(slider)
 
-        lbl_frame = QLabel('Frame 1 / ' + str(len(snapshots)))
+        lbl_frame = QLabel(f'Frame 1 / {n_frames}')
         lbl_frame.setAlignment(Qt.AlignCenter)
-        lbl_frame.setStyleSheet('color: #B0B0B0;')
-        layout.addWidget(lbl_frame)
+        lbl_frame.setStyleSheet('color: #808080; font-size: 10px;')
+        root.addWidget(lbl_frame)
 
-        btn_layout = QHBoxLayout()
-        btn_play  = QPushButton('▶ Reproducir')
-        btn_pause = QPushButton('⏸ Pausar')
-        btn_close = QPushButton('Cerrar')
-
+        # --- controles ---
+        ctrl = QHBoxLayout()
         lbl_vel = QLabel('Velocidad:')
         lbl_vel.setStyleSheet('color: #B0B0B0;')
         combo_vel = QComboBox()
-        # ms por frame; "Lento" por defecto para que la mejora se note bien.
-        VELOCIDADES = {'Lento': 700, 'Normal': 400, 'Rapido': 200}
+        # ms por frame; valores mas lentos para que se vea todo el proceso.
+        VELOCIDADES = {'Muy lento': 1200, 'Lento': 800, 'Normal': 450}
         combo_vel.addItems(list(VELOCIDADES.keys()))
         combo_vel.setCurrentText('Lento')
 
-        btn_layout.addWidget(lbl_vel)
-        btn_layout.addWidget(combo_vel)
+        btn_play  = QPushButton('Reproducir')
+        btn_pause = QPushButton('Pausar')
+        btn_close = QPushButton('Cerrar')
+
+        ctrl.addWidget(lbl_vel)
+        ctrl.addWidget(combo_vel)
+        ctrl.addStretch()
         for b in (btn_play, btn_pause, btn_close):
             b.setMinimumHeight(32)
-            btn_layout.addWidget(b)
-        layout.addLayout(btn_layout)
+            ctrl.addWidget(b)
+        root.addLayout(ctrl)
 
-        # multiplicador de pausa sobre el ultimo frame (la reconstruccion
-        # final), para que el resultado se quede mas tiempo en pantalla.
-        PAUSA_FINAL_MULT = 4
+        # --- logica de animacion ---
 
         def actualizar_frame(idx):
-            visor_temp.establecer_imagen(snapshots[idx])
-            es_final = idx == len(snapshots) - 1
-            extra = '  |  Reconstruccion final' if es_final else ''
-            lbl_frame.setText(f'Frame {idx + 1} / {len(snapshots)}{extra}')
+            visor.establecer_imagen(frames[idx])
+            paso_idx  = pasos_de_frame[idx]
+            paso_name = pasos[paso_idx]
+            sub       = subtitulos[idx]
+            es_final  = idx == n_frames - 1
+            sufijo    = '  [Reconstruccion final - identica al boton Reconstruir]' if es_final else ''
+            lbl_leyenda.setText(
+                f'Paso {paso_idx + 1}/{n_pasos}: {paso_name}  |  {sub}{sufijo}')
+            lbl_frame.setText(f'Frame {idx + 1} / {n_frames}')
+            # resaltar paso en la lista (bloquear la senal para no saltar)
+            lista_pasos.blockSignals(True)
+            lista_pasos.setCurrentRow(paso_idx)
+            lista_pasos.blockSignals(False)
 
         slider.valueChanged.connect(actualizar_frame)
 
         timer = QTimer(dialogo)
 
+        # Hold mas largo al comienzo de un paso nuevo para dar tiempo a leer.
+        HOLD_PASO_MULT = 2
+
         def avanzar():
-            idx = (slider.value() + 1) % len(snapshots)
-            slider.setValue(idx)
-            # si el frame que se acaba de mostrar es el ultimo (la
-            # reconstruccion), alargar la pausa antes de reiniciar el bucle.
-            base = VELOCIDADES[combo_vel.currentText()]
-            es_final = idx == len(snapshots) - 1
-            timer.setInterval(base * PAUSA_FINAL_MULT if es_final else base)
+            idx = slider.value()
+            if idx >= n_frames - 1:
+                # llego al final: detener, no reiniciar
+                timer.stop()
+                return
+            next_idx = idx + 1
+            slider.setValue(next_idx)
+            # ajustar intervalo: mas largo si es el primer frame de un paso nuevo
+            base     = VELOCIDADES[combo_vel.currentText()]
+            es_nuevo = (next_idx == 0 or
+                        pasos_de_frame[next_idx] != pasos_de_frame[next_idx - 1])
+            timer.setInterval(base * HOLD_PASO_MULT if es_nuevo else base)
 
         timer.timeout.connect(avanzar)
 
         def iniciar():
+            # si estaba en el ultimo frame, reiniciar desde el principio
+            if slider.value() >= n_frames - 1:
+                slider.setValue(0)
             timer.start(VELOCIDADES[combo_vel.currentText()])
 
         def cambiar_velocidad():
             if timer.isActive():
-                idx = slider.value()
-                base = VELOCIDADES[combo_vel.currentText()]
-                es_final = idx == len(snapshots) - 1
-                timer.setInterval(base * PAUSA_FINAL_MULT if es_final else base)
+                base     = VELOCIDADES[combo_vel.currentText()]
+                idx      = slider.value()
+                es_nuevo = (idx == 0 or
+                            pasos_de_frame[idx] != pasos_de_frame[max(0, idx - 1)])
+                timer.setInterval(base * HOLD_PASO_MULT if es_nuevo else base)
 
         combo_vel.currentTextChanged.connect(cambiar_velocidad)
         btn_play.clicked.connect(iniciar)
         btn_pause.clicked.connect(timer.stop)
         btn_close.clicked.connect(dialogo.accept)
 
+        # mostrar primer frame y arrancar automaticamente
         actualizar_frame(0)
+        iniciar()
         dialogo.exec()
 
     # helper compartido: ampliacion para mostrar (Reconstruir y Comparar)
@@ -1168,6 +1263,7 @@ class VentanaPrincipal(QMainWindow):
             usar_back_projection=params['back_projection'],
             usar_anti_ringing=params['anti_ringing'],
             usar_multiescala=params['multiescala'],
+            back_gain=params['back_gain'],
             tol=params['tol'], max_iter=params['max_iter'],
         )
 
@@ -1365,12 +1461,14 @@ class VentanaPrincipal(QMainWindow):
                 usar_back_projection=params['back_projection'],
                 usar_anti_ringing=params['anti_ringing'],
                 usar_multiescala=params['multiescala'],
+                back_gain=params['back_gain'],
                 tol=params['tol'], max_iter=params['max_iter'])
             res_realce = upscale_poisson_screened(
                 lr, factor, lam=params['lam'], beta=params['beta'], tau=params['tau'],
                 usar_back_projection=params['back_projection'],
                 usar_anti_ringing=params['anti_ringing'],
                 usar_multiescala=params['multiescala'],
+                back_gain=params['back_gain'],
                 tol=params['tol'], max_iter=params['max_iter'])
 
             def _a_tamano_tile(arr):
