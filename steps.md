@@ -97,7 +97,7 @@ proyecto_rzi/
 |   +-- sor_solver.py        |  Kernel SOR Red-Black con @njit, barrido omega, benchmark
 |   +-- image_ops.py         |  Resize/USM en float64 sin pasar por uint8; conversion RGB<->YCbCr
 |   +-- edge_enhance.py       |  Filtro de shock (Osher-Rudin) y difusion anisotropica (Perona-Malik)
-|   +-- upscaler.py           |  Cascada multiescala, back-projection, anti-ringing, acabado de display
+|   +-- upscaler.py           |  Cascada multiescala, back-projection, anti-ringing, acabado de display, animacion didactica (generar_frames_pipeline)
 |
 +-- services/                <- Capa 3: Servicios de apoyo
 |   +-- metrics.py           |  PSNR, SSIM, interpolacion bicubica, tabla comparativa
@@ -256,7 +256,8 @@ Cuando el usuario hace zoom en una region y pulsa "Reconstruir", ocurre lo sigui
 3. El factor de ampliacion se descompone en una **cascada coarse-to-fine** (multiescala):
    - Factores potencia de 2 (2, 4, 8): cascada completa de etapas x2.
    - Factor 6: una etapa x2 seguida de una etapa x3.
-   - Factores sin esa descomposicion (3, 5, 7) o con "Multiescala" desactivado: una unica etapa al factor pedido.
+   - Factores compuestos mayores: 9->[3,3], 10->[2,5], 12->[2,2,3] (la interfaz admite hasta factor 12).
+   - Factores primos o sin descomposicion conveniente (3, 5, 7, 11) o con "Multiescala" desactivado: una unica etapa al factor pedido.
 4. En cada etapa se construye el problema "screened" (`construir_problema_screened`, seccion 4.4) usando como entrada el resultado de la etapa anterior, y se resuelve con `resolver_screened` (SOR Red-Black paralelo, seccion 6.4).
 5. Tras la cascada, se aplican (si estan activados) **back-projection** y **anti-ringing** del pipeline.
 6. Para mostrarlo, se lleva el resultado al tamaño exacto `tw*factor x th*factor`, se aplica el Unsharp Mask opcional (USM) y, AL FINAL, un segundo paso de **anti-ringing** contra una guia bicubica de ese mismo tamaño (recorta el overshoot que pueda introducir el USM, sin deshacer el realce de `beta`). Esa imagen ampliada es la que se muestra tanto en el visor derecho como en el dialogo de detalle: ambos muestran exactamente la misma reconstruccion.
@@ -277,7 +278,7 @@ new_w = (w - 1) * factor_etapa + 1
 Down(u)   = reducir u al tamano del tile (Image.BOX, promedio de area)
 residuo   = tile - Down(u)
 Up(resid) = agrandar el residuo al tamano de u (Image.BICUBIC)
-u <- u + gain * Up(residuo)         # gain=0.8, 2 pasadas
+u <- u + gain * Up(residuo)         # gain=0.6, 2 pasadas (default)
 ```
 
 Esto corrige el sesgo de baja frecuencia que puede introducir la amplificacion de gradientes, sin deshacer el realce de bordes (el residuo es de baja frecuencia, las altas frecuencias de `u` quedan intactas).
@@ -296,6 +297,7 @@ Esto corrige el sesgo de baja frecuencia que puede introducir la amplificacion d
 | Anti-ringing | on/off | Activa el recorte a limites locales de la bicubica |
 | Filtro shock | on/off | Activa el filtro de shock (Osher-Rudin) en el acabado de display: convierte rampas borrosas en bordes nitidos (seccion 5.3, punto 12) |
 | Difusion (denoise) | on/off | Activa la difusion anisotropica (Perona-Malik) en el acabado de display: limpia ruido de grano en zonas planas preservando los bordes (seccion 5.3, punto 12) |
+| Intensidad back-projection | 0.0..1.0 | `gain` de back-projection: mas alto = mayor fidelidad con la imagen original pero mas grano re-inyectado del tile; mas bajo = imagen mas limpia. Solo tiene efecto si "Back-projection" esta activo. Default 0.6 (antes 0.8) |
 
 El parametro "Nitidez (USM %)" se mantiene como un realce adicional opcional, ahora con un valor por defecto bajo (60%, antes 150%): con `beta>1` la PDE ya hace la mayor parte del realce, y un USM fuerte sumado a `beta` producia un sobre-realce visible como un halo blanco en los bordes. El anti-ringing aplicado DESPUES del USM (ver punto 6 arriba) recorta ese halo si el usuario sube la fuerza del USM.
 
@@ -341,14 +343,67 @@ El flujo "Reconstruir" produce UNA sola imagen, mostrada en dos lugares:
 
 8. **Modo Lupa adaptativo al zoom**: el "Modo Lupa (tiempo real)" tomaba siempre un radio fijo de 60 px de imagen alrededor del cursor y lo ampliaba factor 3, sin importar el zoom de la imagen original, por lo que se comportaba igual estuviera la original ampliada o ajustada a la ventana ("la misma lupa para todo"). Ahora el radio se adapta a la region visible del visor original: en `_actualizar_lupa` (`ui/main_window.py`) se lee `obtener_viewport_imagen()` y el radio se toma como una fraccion (~18%) del lado visible, acotado entre `RADIO_MIN=20` y `RADIO_MAX=80` px. Con zoom in la region visible es chica, el radio baja y la lupa amplia justo la zona que se esta mirando; con zoom out el radio queda topado en `RADIO_MAX`, de modo que la lupa toma una vecindad acotada alrededor del cursor y no intenta ampliar casi toda la imagen. El resto del flujo de la lupa (modelo screened sin cascada para velocidad, throttle de 0.125 s, hilo de calculo) no cambia.
 
-9. **"Animar Convergencia" sobre el modelo screened (mismo pipeline que "Reconstruir")**: en versiones anteriores, "Animar Convergencia" animaba un modelo DISTINTO al de "Reconstruir": usaba `construir_problema_upscale` (Laplace armonico, b=0) y `resolver_con_snapshots` con el kernel viejo `_kernel_sor_rb` (mascara Dirichlet dura, omega ~1.95). Por eso el frame final de la animacion nunca coincidia con la reconstruccion real mostrada en el panel "Reconstruida", y la mejora del modelo screened no se apreciaba.
+9. **"Animar Convergencia" rediseñada: animacion didactica del proceso completo**: en versiones anteriores, el dialogo animaba solo la convergencia interna del solver SOR y mostraba DOS visores lado a lado (la animacion a la izquierda y una bicubica fija de referencia a la derecha). Esto ocultaba todas las demas etapas del proceso (creacion de pixeles por interpolacion, cascada, back-projection, etc.) y confundia al mostrar dos imagenes simultaneas.
 
-   Correccion (diseño modular, para que cualquier mejora futura a "Reconstruir" se refleje tambien en la animacion):
-   - Nueva funcion `finalizar_display(u, tile, factor, usm_pct)` en `core/upscaler.py`: extrae el acabado de display que antes estaba inline en `_upscale_display` (resize a `tw*factor x th*factor` con LANCZOS, USM opcional, anti-ringing final contra una guia bicubica). Tanto `_upscale_display` ("Reconstruir") como cada frame de la animacion llaman a esta misma funcion.
-   - `upscale_poisson_screened` (en `core/upscaler.py`) ahora acepta `capturar_snapshots=True` (con `snapshots_cada` y `max_snapshots`): en ese caso usa la nueva `resolver_screened_con_snapshots` (en `core/sor_solver.py`, espejo de `resolver_con_snapshots` pero para el kernel `_kernel_sor_rb_screened`) en cada etapa de la cascada, acumula los estados intermedios de TODAS las etapas y agrega `imagen_recon` (tras back-projection y anti-ringing) como ultimo snapshot. Sin `capturar_snapshots`, el comportamiento de "Reconstruir" no cambia.
-   - `_animar_convergencia` (en `ui/main_window.py`) ahora llama a `upscale_poisson_screened(..., capturar_snapshots=True)` con los mismos parametros que "Reconstruir" (incluida la cascada multiescala completa coarse-to-fine) y pasa cada snapshot por `finalizar_display`, de modo que todos los frames quedan al mismo tamaño de display y el ULTIMO frame es identico al resultado de "Reconstruir".
-   - El dialogo de animacion (`_mostrar_dialogo_animacion`) ahora muestra dos visores lado a lado: a la izquierda la animacion del modelo screened (arranca suave/bicubica y se afila etapa por etapa hasta la reconstruccion final), y a la derecha una imagen bicubica fija de referencia al mismo tamaño, para que la mejora del modelo sea evidente por comparacion directa. La etiqueta de info muestra la cascada de etapas y el `omega` screened (~1.03) en vez del omega clasico (~1.95).
-   - `construir_problema_upscale` y `resolver_con_snapshots` (Laplace armonico, Enfoque B) ya no se usan desde "Animar Convergencia"; siguen existiendo en `core/` para Barrido Omega y Benchmark.
+   Rediseño completo orientado a presentar TODO el pipeline de reconstruccion en una sola animacion con esquema visual de pasos:
+
+   **Nueva funcion `generar_frames_pipeline`** (`core/upscaler.py`): orquesta el proceso completo capturando un frame al comienzo de cada fase, en este orden:
+
+   ```
+   Fase 1 - Imagen original / vecino mas cercano:
+       resize_float(canal, W, H, NEAREST)
+       Muestra los pocos pixeles conocidos. NN no crea nueva informacion.
+
+   Fase 2 - Interpolacion bicubica (guia G):
+       resize_float(canal, W, H, BICUBIC)
+       Se ven los nuevos pixeles creados por bicubica; esta guia es
+       el punto de partida del solver Poisson.
+
+   Fase 3 - Cascada SOR Screened (una sub-fase por etapa):
+       Para cada etapa_factor en _descomponer_factor(factor):
+           resolver_screened_con_snapshots -> varios frames de convergencia
+           (raw, sin finishing: se ve como u evoluciona de bicubica a Poisson)
+           Submuestreo a max_snaps_por_etapa=14 frames por etapa.
+
+   Fase 4 - Back-projection:
+       back_projection(u, tile) con n_pass=3
+       Correccion iterativa: fuerza Down(u) ~= tile original.
+
+   Fase 5 - Anti-ringing inicial (escala del solver):
+       anti_ringing(u, ref_bicubica_solver)
+       Recorta overshoot antes del resize a display.
+
+   Fase 6 - Difusion anisotropica (si "Difusion" activo):
+       anisotropic_diffusion(display_lanczos)
+       Perona-Malik: limpia ruido en zonas planas.
+
+   Fase 7 - Filtro de shock (si "Filtro shock" activo):
+       shock_filter(display)
+       Osher-Rudin: convierte rampas en bordes nitidos.
+
+   Fase 8 - Realce USM (si Nitidez USM > 0):
+       unsharp_mask_float(display, percent=usm_pct)
+
+   Fase 9 - Reconstruccion final:
+       anti_ringing(display, bic_display)
+       Identico al resultado del boton "Reconstruir".
+   ```
+
+   El ULTIMO frame de la animacion es IDENTICO (pixel a pixel, `allclose`) al resultado que produce `finalizar_display()` para los mismos parametros; ambos usan exactamente las mismas primitivas en el mismo orden.
+
+   **Dialogo rediseñado** (`_mostrar_dialogo_animacion`, `ui/main_window.py`):
+   - UN SOLO visor grande (se elimino el segundo visor "Bicubica de referencia").
+   - Lista de pasos a la IZQUIERDA (QListWidget): muestra todos los pasos del proceso (original, NN, bicubica, etapas SOR, back-projection, anti-ringing, difusion, shock, USM, final) resaltando el paso activo en cada frame.
+   - Leyenda descriptiva debajo del visor, actualizada por frame: nombre del paso, subtitulo con la ecuacion o explicacion, y nota cuando es el frame final.
+   - Velocidades: "Muy lento" (1200 ms/frame), "Lento" (800 ms), "Normal" (450 ms); por defecto "Lento".
+   - Al comienzo de un paso nuevo, el intervalo del timer se multiplica por 2 (HOLD_PASO_MULT) para dar tiempo a leer la leyenda.
+   - La animacion corre de principio a fin y SE DETIENE en la reconstruccion final (no vuelve a empezar en bucle). Hacer click en "Reproducir" desde el final reinicia desde el frame 0.
+   - Clicking en un item de la lista de pasos salta al primer frame de ese paso.
+   - La cabecera muestra: numero de frames, numero de pasos, cascada, omega SOR, iteraciones totales y tiempo.
+
+   Para imagenes a color: `_animar_convergencia` (`ui/main_window.py`) separa Y/Cb/Cr una sola vez, llama a `generar_frames_pipeline` sobre el canal Y, y recombina cada frame 2D con el croma bicubico fijo mediante `ycbcr_a_rgb`. Los frames del dialogo quedan en RGB (H,W,3).
+
+   `construir_problema_upscale` y `resolver_con_snapshots` (Laplace armonico, Enfoque B) ya no se usan desde "Animar Convergencia"; siguen existiendo en `core/` para Barrido Omega y Benchmark.
 
 10. **Pipeline en float de punta a punta (elimina banding/posterizacion a factores altos)**: revisando una reconstruccion x8 se notaba banding (escalones de gris) en zonas planas como el cielo y escalonado en bordes diagonales, aunque el solver converge sano (omega~1.03, monotono). La causa no era el modelo PDE sino la **precision**: la tuberia pasaba varias veces por arreglos `uint8` (256 niveles) sobre degradados suaves:
     - `_preparar_guia_bicubica` (en `core/poisson_builder.py`) construia la guia bicubica `G` convirtiendo el tile a `uint8`, escalando con PIL en modo `'L'` y volviendo a `float`. `G` es el punto de partida (warm start) y la base del termino `b` del solver, asi que sus escalones de 256 niveles se propagaban a TODA la reconstruccion. En una cascada x8 (3 etapas x2), este redondeo se repetia en cada etapa, acumulando el efecto.
@@ -360,13 +415,13 @@ El flujo "Reconstruir" produce UNA sola imagen, mostrada en dos lugares:
 
     `_preparar_guia_bicubica` ahora construye `G` (y el reescalado del tope de memoria) con `resize_float`, y `finalizar_display` reescala y aplica el USM con las funciones de `image_ops`. Solo se cuantiza a 8 bits en el paso final inevitable, al pintar en pantalla (`ui/zoom_viewer.py`). El modelo matematico, el kernel SOR y `construir_problema_upscale` (Enfoque B, Laplace) NO cambian. Como `_preparar_guia_bicubica` la usan Reconstruir, Lupa, Comparar y Animar Convergencia, la mejora es transversal a los cuatro flujos. Verificado headless: en una rampa lineal sintetica, el numero de saltos distintos entre pixeles consecutivos de la guia tras una cascada x8 (3 etapas) pasa de 3 (pipeline `uint8`, escalones gruesos) a 22 (pipeline float, gradiente mucho mas continuo).
 
-11. **Animacion de convergencia: velocidad ajustable y pausa final**: el dialogo de "Animar Convergencia" avanzaba los frames a un intervalo fijo de 166 ms, lo que se sentia demasiado rapido para apreciar la diferencia entre el primer frame (bicubica/suave) y el ultimo (reconstruccion screened). Se agrego un selector "Velocidad" (`Lento`/`Normal`/`Rapido`, con `Lento` por defecto = 700 ms/frame) en `_mostrar_dialogo_animacion` (`ui/main_window.py`). Ademas, cuando el bucle llega al ULTIMO frame (la reconstruccion final), el intervalo del timer se multiplica por 4 (`PAUSA_FINAL_MULT`), de modo que el resultado final queda mas tiempo en pantalla antes de reiniciar el bucle. El cambio de velocidad se aplica de inmediato si la animacion esta corriendo.
+11. **Animacion: velocidades ajustables, pausa al inicio de cada paso y detencion al final**: el dialogo rediseñado (punto 9) usa tres velocidades ("Muy lento" 1200 ms, "Lento" 800 ms, "Normal" 450 ms; por defecto "Lento"). Al inicio de cada paso nuevo del esquema el timer se mantiene el doble del tiempo base (`HOLD_PASO_MULT=2`) para dar tiempo a leer la leyenda. La animacion corre una sola vez y se detiene en la reconstruccion final (no hay bucle): para volver a verla desde el principio se pulsa "Reproducir". El cambio de velocidad se aplica de inmediato si la animacion esta corriendo.
 
 12. **Stack de nitidez pura matematica (back-projection reforzada + filtro de shock + difusion anisotropica)**: revisando una reconstruccion x8 (region 57x103 -> 456x824), la imagen se veia nitida pero con cierto ruido de grano en zonas planas y bordes que seguian algo suaves. La causa de fondo es que la guia bicubica `G` (base del termino `b` del modelo screened, seccion 4.4) es intrinsecamente suave; `beta` solo amplifica gradientes que YA estan presentes en esa guia, por lo que el resultado nunca puede ser mucho mas nitido que "bicubica + realce de bordes", y a factores altos las zonas planas muestran ruido de baja amplitud.
 
     La solucion son tres tecnicas clasicas de super-resolucion sin redes neuronales, todas operadores PDE explicitos y deterministas (sin datos aprendidos ni entrenamiento):
 
-    - **Back-projection iterativa reforzada** (`back_projection` en `core/upscaler.py`): se sube el numero de pasadas por defecto de 2 a 3 (`n_pass=3`). Cada pasada minimiza el residuo `||Down(u) - tile||`, recuperando alta frecuencia de forma principiada. Mas pasadas mejoran la consistencia con el tile original sin llegar a oscilar (`gain=0.8` amortigua entre pasadas).
+    - **Back-projection iterativa** (`back_projection` en `core/upscaler.py`): aplica por defecto 2 pasadas con `gain=0.6`. Cada pasada minimiza el residuo `||Down(u) - tile||`, recuperando alta frecuencia de forma principiada. El mecanismo re-inyecta las altas frecuencias del tile original (incluyendo grano); un `gain` menor y menos pasadas reducen la cantidad de ruido que se propaga a la reconstruccion. Se confirmo que con los defaults anteriores (`n_pass=3, gain=0.8`) la energia de alta frecuencia (proxy de grano) se triplicaba (x3.1) en el paso de back-projection; con los defaults actuales (`n_pass=2, gain=0.6`) se reduce a x2.3 aprox, conservando la mayor parte de la fidelidad. El control "Intensidad back-projection" en la barra lateral permite ajustar el `gain` por imagen (rango 0.0..1.0, default 0.6; subir hacia 0.8 para mas fidelidad/mas grano, bajar para mas limpieza).
 
     - **Filtro de shock de Osher-Rudin / Alvarez-Mazorra** (`shock_filter` en el modulo nuevo `core/edge_enhance.py`): evoluciona la imagen con `u_t = -sign(G_sigma * Laplaciano(u)) * |grad u|` (Euler explicito, 3 iteraciones por defecto). El laplaciano se suaviza con un gaussiano (`sigma=1`) antes de tomar su signo, para no disparar shocks por ruido de alta frecuencia. El efecto es convertir rampas borrosas (transiciones graduales de un borde) en escalones nitidos. Como el tamaño del paso es proporcional a `|grad u|`, en zonas planas (gradiente ~0) la imagen casi no cambia: no introduce escalones artificiales en degradados suaves como el cielo.
 
@@ -398,7 +453,7 @@ El flujo "Reconstruir" produce UNA sola imagen, mostrada en dos lugares:
     - `_abrir_imagen`: detecta si la imagen es a color segun el modo de PIL (cualquier modo que no sea `L`, `1`, `I` o `F`). Si es a color, guarda el RGB completo en `self._imagen_color` y, ademas, su luminancia en `self._imagen_orig` (esta ultima sigue siendo la base de Barrido Omega y Benchmark, que son inherentemente 2D). El visor izquierdo muestra la imagen a color si la hay.
     - `_tile_desde_viewport`: recorta de `self._imagen_color` si existe (si no, de `self._imagen_orig`), devolviendo un tile de 3 canales para imagenes a color.
     - `_upscale_display`, usado por "Reconstruir" y "Comparar": si el tile es a color, separa Y/Cb/Cr, resuelve Y con el pipeline completo y recombina con `finalizar_display_color`. Las referencias "zoom nativo" y "bicubica" del dialogo de detalle tambien se generan a color con `resize_rgb_float`.
-    - "Animar Convergencia": si el tile es a color, separa Y/Cb/Cr una sola vez (el croma no participa de la convergencia, se reescala una unica vez) y cada snapshot de Y se recombina con ese croma fijo via `finalizar_display_color`. La bicubica de referencia del dialogo tambien queda a color.
+    - "Animar Convergencia": si el tile es a color, separa Y/Cb/Cr una sola vez, llama a `generar_frames_pipeline` sobre el canal Y (el croma no participa en el pipeline matematico) y recombina cada frame 2D con el croma bicubico fijo via `ycbcr_a_rgb`. El dialogo muestra frames RGB cuando la imagen de entrada es a color.
     - "Modo Lupa": si hay imagen a color, resuelve solo la luminancia (sin cascada, igual que antes) y recombina con croma bicubico. La lupa NO aplica difusion ni filtro de shock (se prioriza la velocidad en tiempo real); el resto de los flujos si los aplica.
     - "Comparar 3 modelos", "Barrido Omega" y "Benchmark": las metricas PSNR/SSIM/GMSD y la tabla comparativa son 2D por construccion (GMSD usa convolucion de Prewitt sobre una matriz 2D), asi que si el tile es a color se convierte a luminancia (`imagen_a_grises`) solo para esa parte de analisis. La imagen mostrada en "Comparar" (visor derecho) si queda a color, via `_upscale_display`.
 
@@ -422,7 +477,7 @@ Esta seccion explica TODOS los controles del panel "Parametros" (barra lateral i
 
 | Grupo | Parametro | Que hace | Valor optimo | Por que |
 |-------|-----------|----------|---------------|---------|
-| Submuestreo | Factor | Cuantas veces se amplia la region (con factor=4 se conoce 1 de cada 16 pixeles) | 4 (subir a 8 solo si la region de interes es pequeña) | A mayor factor, mas trabajo de extrapolacion tiene que hacer la PDE y mas se nota cualquier ruido; factor 4 es el punto donde la mejora sobre bicubica es clara sin que el costo computacional crezca demasiado. Factor 8 sigue funcionando bien gracias a la cascada multiescala (ver Multiescala) |
+| Submuestreo | Factor | Cuantas veces se amplia la region (con factor=4 se conoce 1 de cada 16 pixeles). Rango: 2..12 | 4 (subir a 8 solo si la region de interes es pequeña) | A mayor factor, mas trabajo de extrapolacion tiene que hacer la PDE y mas se nota cualquier ruido; factor 4 es el punto donde la mejora sobre bicubica es clara sin que el costo computacional crezca demasiado. Factor 8 sigue funcionando bien gracias a la cascada multiescala (ver Multiescala). Factores hasta 12 son posibles: la cascada los descompone automaticamente (ej: x12 -> x2, x2, x3) |
 | Solver SOR Red-Black | Tolerancia | Umbral de residuo relativo para detener las iteraciones | 1e-5 (valor por defecto) | Suficientemente estricto para que el solver converja a una solucion estable de la PDE sin iteraciones de mas; bajarlo mas (1e-6, 1e-7) no cambia visiblemente el resultado pero si el tiempo de calculo |
 | Solver SOR Red-Black | Max iter | Tope de iteraciones SOR por etapa | 2000 (valor por defecto) | Con `omega` optimo (ver siguiente fila) el solver converge en unas pocas decenas/centenas de iteraciones; 2000 deja margen amplio sin arriesgar tiempos de espera largos si una region no converge |
 | Solver SOR Red-Black | Omega auto | Si esta activo, calcula el `omega` optimo de SOR con la formula de la seccion 7.3 en vez de usar un valor fijo | Activado (ON) | `omega` optimo depende del tamaño de la malla en cada etapa de la cascada; calcularlo automaticamente asegura convergencia rapida en todas las etapas sin que el usuario tenga que ajustarlo a mano |
@@ -432,12 +487,13 @@ Esta seccion explica TODOS los controles del panel "Parametros" (barra lateral i
 | Nitidez Adaptativa | Beta (amplificacion) | Ganancia maxima sobre los gradientes de bordes reales (1 = sin amplificacion) | 1.6-1.8 (1.7 por defecto) | Valores cercanos a 1 dan resultados casi identicos a la bicubica; valores cercanos a 3 amplifican tanto que cualquier textura o ruido leve en la guia se exagera, generando un aspecto "sobreprocesado". 1.6-1.8 amplifica los bordes reales de forma notoria sin exagerar el ruido |
 | Nitidez Adaptativa | Tau (umbral) | Magnitud de gradiente por debajo de la cual NO se amplifica (evita realzar ruido) | 0.02-0.03 (0.02 por defecto) | Si `tau` es muy bajo, `beta` amplifica tambien las variaciones pequeñas de ruido de la guia bicubica; si es muy alto, deja de amplificar texturas finas reales. 0.02-0.03 amplifica bordes pero no el ruido de fondo |
 | Nitidez Adaptativa | Multiescala | Resuelve en cascada coarse-to-fine (factores potencia de 2) | Activado (ON) | Cada etapa parte de un buen "warm start" (resultado de la etapa anterior, ya con bordes amplificados), lo que mejora la calidad final y reduce el numero total de iteraciones SOR respecto de resolver directo al factor final, especialmente en factor 8 |
-| Nitidez Adaptativa | Back-projection | Refuerza que reducir el resultado (`Down(u)`) vuelva a dar el tile original | Activado (ON), 3 pasadas (reforzado, ver punto 12 de 5.3) | Corrige el sesgo de baja frecuencia que puede introducir `beta` sin deshacer el realce de bordes; 3 pasadas (antes 2) recuperan mas detalle de alta frecuencia sin oscilar, gracias a `gain=0.8` |
+| Nitidez Adaptativa | Back-projection | Refuerza que reducir el resultado (`Down(u)`) vuelva a dar el tile original | Activado (ON), 2 pasadas, ver punto 12 de 5.3 | Corrige el sesgo de baja frecuencia que puede introducir `beta` sin deshacer el realce de bordes |
+| Nitidez Adaptativa | Intensidad back-projection | `gain` del paso de back-projection (0.0..1.0): cuanto se aplica la correccion de residuo en cada pasada | 0.6 (default); subir a 0.8 para mas fidelidad/mas grano, bajar a 0.3-0.4 para imagen mas limpia | El paso re-inyecta altas frecuencias del tile original, incluido el grano; reducir el gain es la forma mas directa de controlar ese ruido sin desactivar la correccion de fidelidad |
 | Nitidez Adaptativa | Anti-ringing | Recorta el resultado a los limites locales (3x3) de la guia bicubica | Activado (ON) | Es la red de seguridad final contra cualquier sobre-realce (halos) que puedan introducir `beta`, el filtro de shock o el USM; sin costo perceptible en calidad cuando no hay overshoot |
 | Nitidez Adaptativa | Filtro shock | Filtro de shock de Osher-Rudin: convierte rampas borrosas en bordes nitidos (punto 12 de 5.3) | Activado (ON) | Es el responsable principal de que los bordes se vean "definidos" en vez de "suaves"; en zonas planas (gradiente bajo) practicamente no actua, por lo que no introduce artefactos en degradados |
 | Nitidez Adaptativa | Difusion (denoise) | Difusion anisotropica de Perona-Malik: limpia ruido de grano en zonas planas preservando bordes (punto 12 de 5.3) | Activado (ON) | Limpia el ruido de baja amplitud que aparece en zonas planas a factores altos, sin difuminar los bordes (la funcion de parada de borde detecta donde NO difundir) |
 
-**En resumen**, la configuracion que da la mejor calidad es la que viene por defecto al abrir la aplicacion: Omega auto, Multiescala, Back-projection, Anti-ringing, Filtro shock y Difusion todos activados, con `Lambda=8`, `Beta=1.7`, `Tau=0.02` y `USM=60%`. Los unicos ajustes que vale la pena probar segun la imagen son subir `Lambda` a 10-12 si se pierde detalle fino, o bajar `USM` a 30-40% si se nota algun halo residual en bordes muy fuertes.
+**En resumen**, la configuracion que da la mejor calidad es la que viene por defecto al abrir la aplicacion: Omega auto, Multiescala, Back-projection, Anti-ringing, Filtro shock y Difusion todos activados, con `Lambda=8`, `Beta=1.7`, `Tau=0.02`, `USM=60%` e `Intensidad back-projection=0.6`. Los ajustes que vale la pena probar segun la imagen son: subir `Lambda` a 10-12 si se pierde detalle fino; bajar `USM` a 30-40% si se nota algun halo residual en bordes muy fuertes; subir la "Intensidad back-projection" hacia 0.8 si se quiere mas fidelidad con el tile original (a costa de mas grano), o bajarla hacia 0.3-0.4 si la imagen muestra ruido visible en zonas planas.
 
 ---
 
