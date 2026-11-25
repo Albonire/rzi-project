@@ -34,3 +34,14 @@ core.[0-9]*
 # If a file named 'core' exists, ignore it, but keep the directory
 /core
 !core/
+
+# Cache de compilacion de Numba
+*.nbi
+*.nbc
+
+# Pruebas
+.pytest_cache/
+
+# Intermedios del documento
+docs/estudio/*.docx
+docs/estudio/documento.html

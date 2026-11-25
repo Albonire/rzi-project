@@ -1,0 +1,6 @@
+factor,omega_malla_completa,omega_estimado,omega_empirico,iter_con_estimado,iter_con_malla_completa
+2,1.9757,1.1715,1.1800,8,370
+3,1.9757,1.3741,1.3825,14,359
+4,1.9757,1.5104,1.5175,20,353
+6,1.9757,1.6672,1.6750,31,345
+8,1.9757,1.7509,1.7650,54,341

@@ -634,7 +634,7 @@ omega = 2 / (1 + sqrt(1 - rho_J^2))</code></pre>
   <div class="slide-title">Con restricciones interiores, el omega optimo empirico (1.52) difiere mucho del teorico (1.95)</div>
 
   <figure style="flex:1;">
-    <img src="../assets/barrido_omega.png" alt="Curva iteraciones vs omega">
+    <img src="assets/barrido_omega.png" alt="Curva iteraciones vs omega">
     <figcaption>Barrido empirico. El minimo (linea verde punteada) esta en 1.52, no en 1.95. Las restricciones interiores (pixeles conocidos cada "factor" posiciones en la malla) modifican el radio espectral efectivo. Usar 1.95 aumenta las iteraciones y acerca el solver a la divergencia.</figcaption>
   </figure>
 
@@ -648,7 +648,7 @@ omega = 2 / (1 + sqrt(1 - rho_J^2))</code></pre>
   <div class="slide-title">El residuo L2 cae cuatro ordenes de magnitud en 325 iteraciones con decaimiento lineal en escala log</div>
 
   <figure style="flex:1;">
-    <img src="../assets/convergencia.png" alt="Decaimiento del residuo">
+    <img src="assets/convergencia.png" alt="Decaimiento del residuo">
     <figcaption>Curva de convergencia del solver SOR Red-Black (omega = 1.95, modelo armonico). El patron oscilante de alta frecuencia es tipico del barrido Red-Black: los rojos y negros se alternan. La trayectoria general es estrictamente decreciente.</figcaption>
   </figure>
 
@@ -717,7 +717,7 @@ def kernel_sor_rb(u, b, lam_map, omega, red):
 
   <div class="c2">
     <figure style="flex:1;display:flex;flex-direction:column;justify-content:center;">
-      <img src="../assets/benchmark.png" alt="Python vs Numba">
+      <img src="assets/benchmark.png" alt="Python vs Numba">
       <figcaption>Python puro (naranja) vs Numba @njit (azul, casi invisible). 100 iteraciones. La barra azul existe pero es imperceptible a esta escala.</figcaption>
     </figure>
     <div>
@@ -878,7 +878,7 @@ Cr = 0.5*R - 0.419*G - 0.081*B + 0.5</code></pre>
   <div class="slide-title">Los bordes del solver son notablemente mas nitidos que la bicubica en zonas con textura</div>
 
   <figure style="flex:1;">
-    <img src="../assets/upscaling_demo.png" alt="Comparacion visual">
+    <img src="assets/upscaling_demo.png" alt="Comparacion visual">
     <figcaption>Izquierda: bicubica. Centro: Poisson screened sin amplificacion de gradientes (beta=1). Derecha: con beta=1.7 y shock filter. Los bordes en la version derecha son mas escarpados; el detalle de textura es mas pronunciado. Las tres imagenes tienen el mismo factor de upscaling.</figcaption>
   </figure>
 

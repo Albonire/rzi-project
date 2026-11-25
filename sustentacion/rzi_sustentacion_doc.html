@@ -791,12 +791,12 @@ omega_opt = 2 / (1 + sqrt(1 - rho_J^2))
 omega_opt = 2 / (1 + sqrt(1 - rho_J^2))</code></pre>
 
   <figure>
-    <img src="../assets/barrido_omega.png" alt="Curva de iteraciones vs omega">
+    <img src="assets/barrido_omega.png" alt="Curva de iteraciones vs omega">
     <figcaption>Barrido empirico de omega para un tile 64x64 con factor 4. El minimo (empirico = 1.52) cae lejos del teorico (1.95) porque el problema tiene restricciones interiores que modifican la estructura espectral. El SOR diverge para omega cercano a 2.</figcaption>
   </figure>
 
   <figure>
-    <img src="../assets/convergencia.png" alt="Decaimiento del residuo L2">
+    <img src="assets/convergencia.png" alt="Decaimiento del residuo L2">
     <figcaption>Convergencia del solver SOR Red-Black con omega = 1.95 sobre el modelo armonico. El residuo L2 cae cuatro ordenes de magnitud en 325 iteraciones. La oscilacion de alta frecuencia en la curva es el patron tipico del barrido Red-Black.</figcaption>
   </figure>
 
@@ -878,7 +878,7 @@ def _kernel_sor_rb_screened(u, b, lam_map, mascara, omega, red):
   </div>
 
   <figure>
-    <img src="../assets/benchmark.png" alt="Benchmark Python vs Numba">
+    <img src="assets/benchmark.png" alt="Benchmark Python vs Numba">
     <figcaption>Tiempo de ejecucion de 100 iteraciones del solver. Python puro tarda 0.06-0.60 s segun el tamano; Numba @njit tarda menos de 2 ms en todos los casos (barra azul casi invisible). La aceleracion es de 380-444x.</figcaption>
   </figure>
 </section>
@@ -981,7 +981,7 @@ G = Y_hr - 0.34414*(Cb_hr - 0.5) - 0.71414*(Cr_hr - 0.5)
 B = Y_hr + 1.772 * (Cb_hr - 0.5)</code></pre>
 
   <figure>
-    <img src="../assets/upscaling_demo.png" alt="Comparacion visual del upscaling">
+    <img src="assets/upscaling_demo.png" alt="Comparacion visual del upscaling">
     <figcaption>Comparacion de tres versiones de la misma region: bicubica (izquierda), Poisson SOR sin realce de gradientes (centro), y Poisson SOR con beta=1.7 y shock filter (derecha). Los bordes en la version derecha son mas nitidos y el detalle de textura es mas pronunciado.</figcaption>
   </figure>
 </section>
@@ -1156,7 +1156,7 @@ GMSD = desviacion_estandar(GMS)     # menor = mejor</code></pre>
   </p>
 
   <figure>
-    <img src="../assets/comparacion_4modelos.png" alt="Comparacion de 4 metodos">
+    <img src="assets/comparacion_4modelos.png" alt="Comparacion de 4 metodos">
     <figcaption>Comparacion visual: original (verdad de campo), bicubica Pillow, Laplace puro y Poisson SOR, sobre un recorte de la imagen camara. Las diferencias son sutiles en zonas de fondo uniforme; se destacan mas en los bordes del objeto central.</figcaption>
   </figure>
 
