@@ -59,6 +59,7 @@ from services.exporter import (guardar_imagen, exportar_csv, grafica_convergenci
                                grafica_barrido_omega, grafica_comparacion,
                                grafica_benchmark, elegir_recorte, figura_a_imagen)
 from services.diagnostico import ejecutar_diagnostico
+from core.denoise import estimar_ruido, UMBRAL_AUTO
 
 
 RUTA_LOG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -327,6 +328,15 @@ PRESETS = {
 }
 PERSONALIZADO = 'Personalizado'
 
+ENTRADAS = (
+    ('Automatica (recomendada)', 'auto'),
+    ('Con ruido: limpiar', 'ruido'),
+    ('JPEG muy comprimido', 'jpeg'),
+    ('Sin limpieza', 'no'),
+)
+TEXTO_LIMPIEZA = {'no': 'sin limpieza', 'ruido': 'limpieza de ruido',
+                  'jpeg': 'suavizado de bloques JPEG'}
+
 
 class PanelParametros(QWidget):
     reconstruir_solicitado = Signal()
@@ -379,6 +389,17 @@ class PanelParametros(QWidget):
             'Rapido: menos ciclos, para probar.\n'
             'Bordes marcados: agrega realce visual (baja un poco el PSNR).')
         gl.addWidget(self.combo_preset, 1, 1)
+        gl.addWidget(QLabel('Entrada:'), 2, 0)
+        self.combo_entrada = QComboBox()
+        for texto, modo in ENTRADAS:
+            self.combo_entrada.addItem(texto, modo)
+        self.combo_entrada.setToolTip(
+            'Automatica: mide el ruido de la zona y la limpia solo si es claro.\n'
+            'Con ruido: limpia siempre con variacion total (fotos de celular de noche,\n'
+            'escaneos con grano).\n'
+            'JPEG muy comprimido: suaviza levemente los bloques de 8x8.\n'
+            'Sin limpieza: usa la imagen tal cual.')
+        gl.addWidget(self.combo_entrada, 2, 1)
         lay.addWidget(g_amp)
 
         self.btn_reconstruir = QPushButton('Ampliar region (RZI)')
@@ -556,6 +577,7 @@ class PanelParametros(QWidget):
             'tol':          self.spin_tol.value(),
             'sor_iters':    self.spin_iters.value(),
             'omega':        None if self.chk_omega_auto.isChecked() else self.spin_omega.value(),
+            'limpieza':     self.combo_entrada.currentData(),
         }
 
     def deshabilitar(self, flag: bool):
@@ -569,7 +591,8 @@ def kwargs_rzi(p: dict, **cambios) -> dict:
     kw = dict(lam=p['lam'], beta=p['beta'], rho=p['rho'], tau=p['tau'], sigma=p['sigma'],
               ciclos=p['ciclos'], bp_final=p['bp_final'], sor_iters=p['sor_iters'],
               tol=p['tol'], omega=p['omega'], realce=p['realce'],
-              usar_anti_ringing=p['anti_ringing'])
+              usar_anti_ringing=p['anti_ringing'], limpieza=p.get('limpieza', 'auto'),
+              sigma_ruido=p.get('sigma_ruido'))
     kw.update(cambios)
     return kw
 
@@ -958,6 +981,11 @@ class VentanaPrincipal(QMainWindow):
         es_color = not (np.allclose(arr[..., 0], arr[..., 1])
                         and np.allclose(arr[..., 1], arr[..., 2]))
         self._imagen_orig = imagen_a_grises(arr)
+        # el ruido es una propiedad de toda la foto: se mide una vez sobre una
+        # zona central grande (en un recorte pequeno se confunde con textura)
+        H0, W0 = self._imagen_orig.shape
+        c = self._imagen_orig[max(0, (H0 - 1024) // 2):][:1024, max(0, (W0 - 1024) // 2):][:, :1024]
+        self._sigma_imagen = estimar_ruido(c)
         self._imagen_color = arr if es_color else None
         self._nombre_imagen = nombre
         self.pila_orig.setCurrentIndex(1)
@@ -970,6 +998,8 @@ class VentanaPrincipal(QMainWindow):
         self._actualizar_info_region()
         self.statusBar().showMessage(
             f"Imagen cargada ({'color' if es_color else 'grises'}): {nombre} ({w}x{h} px). "
+            f"Ruido estimado {self._sigma_imagen:.4f} "
+            f"({'se limpiara automaticamente' if self._sigma_imagen > UMBRAL_AUTO else 'no hace falta limpiar'}). "
             f"Paso 2: haga zoom con la rueda sobre la zona que quiere ampliar.")
 
     def cargar_imagen(self, ruta: str) -> None:
@@ -1106,6 +1136,12 @@ class VentanaPrincipal(QMainWindow):
         return {'res': res, 'display': res['imagen_recon'], 'bicubica': bic,
                 'nn': nn, 'tile': tile}
 
+    def _params_ampliar(self) -> dict:
+        """Parametros del panel + el ruido medido sobre la imagen completa."""
+        params = self.panel_params.obtener_params()
+        params['sigma_ruido'] = getattr(self, '_sigma_imagen', None)
+        return params
+
     def _verificar_tamano(self, tile: np.ndarray, factor: int) -> bool:
         """Avisa con un mensaje claro si la salida seria demasiado grande."""
         try:
@@ -1190,7 +1226,7 @@ class VentanaPrincipal(QMainWindow):
         if info is None:
             return
         tile, tx, ty, tw, th = info
-        params = self.panel_params.obtener_params()
+        params = self._params_ampliar()
         factor = params['factor']
         if not self._verificar_tamano(tile, factor):
             return
@@ -1231,7 +1267,9 @@ class VentanaPrincipal(QMainWindow):
         self.statusBar().showMessage(
             f"RZI x{datos['factor']}: region {tw}x{th} -> {W}x{H} px en {seg:.1f} s  |  "
             f"iter SOR={res['iteraciones']}  omega={res['omega']:.3f}  "
-            f"conv={'Si' if res['convergio'] else 'No'}{bloques}")
+            f"conv={'Si' if res['convergio'] else 'No'}{bloques}  |  "
+            f"ruido estimado {res.get('sigma_estimado', 0):.4f}: "
+            f"{TEXTO_LIMPIEZA.get(res.get('limpieza_aplicada', 'no'))}")
         self._mostrar_dialogo_detalle(datos)
 
     def _mostrar_dialogo_detalle(self, datos: dict):
@@ -1249,6 +1287,19 @@ class VentanaPrincipal(QMainWindow):
         lbl.setWordWrap(True)
         lbl.setStyleSheet('color: #B0B0B0; padding: 4px;')
         layout.addWidget(lbl)
+        res = datos['res']
+        aplicada = res.get('limpieza_aplicada', 'no')
+        lbl_ruido = QLabel(
+            f"Ruido estimado de la entrada: {res.get('sigma_estimado', 0):.4f}. "
+            + ('No hizo falta limpiarla.' if aplicada == 'no' else
+               f"Se aplico {TEXTO_LIMPIEZA[aplicada]} (variacion total) antes de ampliar; "
+               'las columnas de vecino y bicubica muestran la entrada original. '
+               'Por eso la nitidez y la consistencia de RZI salen mas bajas: el ruido '
+               'tambien cuenta como "borde" y ya no se copia (es lo buscado).'))
+        lbl_ruido.setWordWrap(True)
+        lbl_ruido.setStyleSheet('color: #FFB74D; padding: 2px 4px;' if aplicada != 'no'
+                                else 'color: #81C784; padding: 2px 4px;')
+        layout.addWidget(lbl_ruido)
 
         fila = QHBoxLayout()
         visores = []
@@ -1498,7 +1549,7 @@ class VentanaPrincipal(QMainWindow):
         tile = fuente[y0:y1, x0:x1, ...]
         if min(tile.shape[0], tile.shape[1]) < 8:
             return
-        params = self.panel_params.obtener_params()
+        params = self._params_ampliar()
 
         def tarea():
             return upscale(tile, 3, **kwargs_rzi(params, ciclos=4, sor_iters=60,
@@ -1526,7 +1577,7 @@ class VentanaPrincipal(QMainWindow):
         if info is None:
             return
         tile = info[0]
-        params = self.panel_params.obtener_params()
+        params = self._params_ampliar()
         factor = params['factor']
         if tile.shape[0] * tile.shape[1] * factor * factor > MAX_PIXELES_BLOQUE:
             QMessageBox.information(
