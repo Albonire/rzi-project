@@ -12,7 +12,7 @@ date: "Noviembre de 2026"
 
 <div class="caja">
 
-**Como leer este documento.** Cada tema sigue el mismo orden: primero la idea intuitiva, despues la formula y al final un ejemplo o un dato medido. Si solo tiene una hora antes de la sustentacion, lea la seccion 1 (resumen), la seccion 9 (resultados), la seccion 11 (limitaciones) y la seccion 12 (preguntas probables). Todas las cifras de este documento salen de ejecutar `python scripts/generar_resultados.py` sobre el codigo actual, y se pueden reproducir.
+**Como leer este documento.** Cada tema sigue el mismo orden: primero la idea intuitiva, despues la formula y al final un ejemplo o un dato medido. Si solo tiene una hora antes de la sustentacion, lea la seccion 1 (resumen), la seccion 9 (resultados), la seccion 10 (pruebas con imagenes reales), la seccion 12 (limitaciones) y la seccion 13 (preguntas probables). Todas las cifras de este documento salen de ejecutar `python scripts/generar_resultados.py` sobre el codigo actual, y se pueden reproducir.
 
 </div>
 
@@ -62,7 +62,7 @@ Todas estas tecnicas miran solo unos pocos vecinos y aplican siempre la misma fo
 
 ## 2.3 Por que no basta con "afilar" despues
 
-Una idea tentadora es ampliar con bicubica y luego aplicar un filtro de nitidez (por ejemplo, la "mascara de enfoque" o *unsharp mask*). El problema es que esos filtros no saben cual era la imagen original: exageran el contraste de cualquier cosa, crean halos alrededor de los bordes y amplifican el ruido. La version anterior de este proyecto lo hacia y **bajaba el PSNR hasta 4 dB** respecto a no hacer nada (seccion 10). RZI, en cambio, mejora la nitidez **sin dejar de respetar** los datos originales.
+Una idea tentadora es ampliar con bicubica y luego aplicar un filtro de nitidez (por ejemplo, la "mascara de enfoque" o *unsharp mask*). El problema es que esos filtros no saben cual era la imagen original: exageran el contraste de cualquier cosa, crean halos alrededor de los bordes y amplifican el ruido. La version anterior de este proyecto lo hacia y **bajaba el PSNR hasta 4 dB** respecto a no hacer nada (seccion 11). RZI, en cambio, mejora la nitidez **sin dejar de respetar** los datos originales.
 
 # 3. De la imagen a una ecuacion
 
@@ -98,7 +98,7 @@ Escrita en la forma que usa el programa (multiplicando por $-1$), la ecuacion de
 
 $$4\,u_{i,j} - u_{i-1,j} - u_{i+1,j} - u_{i,j-1} - u_{i,j+1} = b_{i,j}$$
 
-con $b = -\nabla^2 G$. **Este signo menos es importante:** en la version anterior estaba invertido y por eso Poisson daba peor resultado que Laplace (seccion 10).
+con $b = -\nabla^2 G$. **Este signo menos es importante:** en la version anterior estaba invertido y por eso Poisson daba peor resultado que Laplace (seccion 11).
 
 ## 3.4 Condiciones de frontera de Dirichlet
 
@@ -387,7 +387,94 @@ El modelo supone que la imagen pequena se obtuvo con un nucleo bicubico (el oper
 
 Conclusion honesta: RZI **sigue ganando** aunque el modelo de degradacion no sea exacto, pero gana menos. Esto es esperable y conviene decirlo en la sustentacion.
 
-# 10. Errores encontrados y corregidos
+# 10. Pruebas con imagenes reales del equipo {.salto}
+
+Ademas de las 4 imagenes estandar, el equipo reunio 25 imagenes propias en la carpeta `imagenes_ejemplo/`: fotografias, arte digital, una radiografia, capturas; varias son JPEG muy comprimidos. Todo se reproduce con `python scripts/evaluar_imagenes.py`.
+
+## 10.1 En condiciones limpias: RZI gana en las 25
+
+Mismo protocolo de verdad de campo (seccion 8.1), sobre la luminancia de un recorte central de hasta 768 px:
+
+| Imagen | x2 bicubica | x2 RZI | Ganancia x2 | x4 bicubica | x4 RZI | Ganancia x4 |
+|:---|:---:|:---:|:---:|:---:|:---:|:---:|
+| 10.jpeg | 30.23 | 32.08 | **+1.85** | 25.30 | 26.24 | **+0.94** |
+| 11.jpeg | 27.13 | 28.36 | **+1.23** | 23.34 | 24.02 | **+0.68** |
+| 12.jpeg | 35.02 | 37.23 | **+2.21** | 29.67 | 30.64 | **+0.96** |
+| 13.jpeg | 29.98 | 30.80 | **+0.82** | 27.00 | 27.73 | **+0.72** |
+| 14.jpeg | 32.18 | 33.33 | **+1.15** | 29.05 | 29.78 | **+0.73** |
+| 15.jpeg | 60.01 | 60.57 | **+0.55** | 54.52 | 55.72 | **+1.20** |
+| 16.avif | 36.97 | 37.81 | **+0.84** | 34.31 | 34.74 | **+0.43** |
+| 16.jpeg | 29.82 | 31.15 | **+1.33** | 25.68 | 26.39 | **+0.71** |
+| 16.webp | 38.72 | 40.24 | **+1.52** | 33.63 | 34.58 | **+0.95** |
+| 17.jpeg | 31.15 | 32.68 | **+1.53** | 26.81 | 27.59 | **+0.79** |
+| 27f72600ae2933c66e37d556a23a7e | 30.18 | 31.09 | **+0.91** | 27.09 | 27.43 | **+0.33** |
+| 4.jpeg | 34.05 | 34.90 | **+0.84** | 31.24 | 31.70 | **+0.46** |
+| 6.jpeg | 38.59 | 39.83 | **+1.24** | 34.50 | 35.41 | **+0.92** |
+| 7.jpeg | 44.45 | 47.71 | **+3.26** | 37.63 | 38.91 | **+1.28** |
+| 7aa9873d166b0505ffaf069db9c2a4 | 38.05 | 39.37 | **+1.33** | 34.29 | 35.13 | **+0.84** |
+| 8.jpeg | 27.37 | 28.19 | **+0.83** | 24.87 | 25.15 | **+0.28** |
+| HXNHFlzWkAATVdo.jpg | 39.46 | 41.19 | **+1.74** | 34.72 | 36.13 | **+1.40** |
+| _ (4).jpeg | 34.88 | 35.75 | **+0.87** | 32.16 | 32.67 | **+0.51** |
+| amir-zand-detach-copy.jpg | 26.12 | 26.98 | **+0.86** | 23.43 | 24.09 | **+0.66** |
+| amir-zand-twittercrop3.jpg | 33.03 | 34.65 | **+1.62** | 29.40 | 30.18 | **+0.78** |
+| bf4665156919993.636f95cdcb58f. | 42.70 | 45.41 | **+2.70** | 36.61 | 37.84 | **+1.23** |
+| bf82f6ac03c71e659f9a771f7ac10f | 49.94 | 54.19 | **+4.26** | 44.01 | 48.23 | **+4.22** |
+| brain x-ray.jpeg | 31.69 | 34.82 | **+3.13** | 25.12 | 26.65 | **+1.53** |
+| danijl-untitled.webp | 47.99 | 49.76 | **+1.77** | 43.11 | 44.68 | **+1.57** |
+| matthias-schmidt-gas-giant-02. | 41.84 | 43.18 | **+1.34** | 37.54 | 38.26 | **+0.73** |
+
+- **x2:** +1.59 dB de media sobre la bicubica (de +0.55 a +4.26); gana en **25 de 25** imagenes, y tambien a Lanczos en 25 de 25.
+- **x4:** +0.99 dB de media (de +0.28 a +4.22); gana en **25 de 25**, y a Lanczos en 25 de 25.
+- SSIM y GMSD tambien mejoran en las 25 imagenes, en ambos factores.
+
+![Ganancia de RZI sobre la bicubica en cada imagen del equipo.](../figuras/ejemplos_ganancia.png){width=85%}
+
+Las mayores ganancias aparecen en imagenes con bordes limpios y contrastados (graficos, la radiografia, arte digital); las menores, en fotos con mucha textura fina o desenfocadas, donde hay poco borde que reconstruir.
+
+## 10.2 El punto debil que encontramos: entrada con JPEG o con ruido
+
+Al ampliar una foto real, la imagen pequena casi nunca esta "limpia": viene comprimida en JPEG o tiene ruido del sensor. Lo simulamos comprimiendo o agregando ruido a la imagen pequena antes de ampliarla. Ganancia media sobre la bicubica (25 imagenes, recorte de 512 px):
+
+| Entrada | Factor | RZI sin limpieza | RZI limpieza automatica | RZI limpieza manual |
+|:---|:---:|:---:|:---:|:---:|
+| JPEG calidad 75 | x2 | -0.03 dB | -0.03 dB (0/25) | +0.19 dB (JPEG) |
+| JPEG calidad 75 | x4 | +0.04 dB | +0.04 dB (0/25) | +0.20 dB (JPEG) |
+| JPEG calidad 50 | x2 | -0.21 dB | -0.21 dB (0/25) | +0.22 dB (JPEG) |
+| JPEG calidad 50 | x4 | -0.12 dB | -0.12 dB (0/25) | +0.19 dB (JPEG) |
+| Ruido 0.01 | x2 | -0.61 dB | -0.64 dB (2/25) | +1.71 dB (ruido) |
+| Ruido 0.01 | x4 | -0.37 dB | -0.37 dB (1/25) | +1.28 dB (ruido) |
+| Ruido 0.02 | x2 | -1.81 dB | +2.32 dB (23/25) | +2.43 dB (ruido) |
+| Ruido 0.02 | x4 | -1.30 dB | +1.77 dB (23/25) | +1.80 dB (ruido) |
+
+**Por que pasa.** La back-projection obliga a que la ampliacion, al reducirse, sea *exactamente* la imagen pequena. Si la imagen pequena trae ruido, el modelo lo trata como informacion real, lo copia y ademas lo refuerza como si fueran bordes. Sin limpieza, con ruido de 0.02, RZI quedaba 1.8 dB **por debajo** de la bicubica.
+
+## 10.3 La solucion: limpiar la entrada con variacion total
+
+**Variacion total (modelo ROF, Rudin, Osher y Fatemi, 1992).** Se busca la imagen $u$ mas parecida a la entrada $f$ pero con la menor "variacion total" posible:
+
+$$\min_u \; \sum \lVert \nabla u \rVert \;+\; \frac{1}{2\,p} \sum (u - f)^2$$
+
+El primer termino penaliza las oscilaciones (el ruido) pero, a diferencia de un desenfoque, permite saltos bruscos (los bordes). Su ecuacion de Euler-Lagrange es una **EDP de difusion no lineal**: difunde mucho donde la imagen es plana y casi nada a traves de los bordes. El peso $p$ se elige proporcional al ruido medido ($p = 0.7\,\sigma$).
+
+**Como se mide el ruido $\sigma$ (Immerkaer, 1996).** Se aplica a la imagen un filtro de segundas diferencias
+
+$$N = \begin{pmatrix} 1 & -2 & 1 \\ -2 & 4 & -2 \\ 1 & -2 & 1 \end{pmatrix}$$
+
+que anula las zonas planas y las rampas suaves; lo que queda es casi solo ruido. Para no confundir textura con ruido, se promedia solo en el 10 % de pixeles con menor gradiente (zonas planas). Medido: las imagenes limpias dan $\sigma \approx 0.002$; con ruido de 0.02 da $\sigma \approx 0.020$.
+
+**Cuando se limpia.** En modo automatico solo se limpia si $\sigma > 0.013$. Este umbral se eligio para que **ninguna** de las 25 imagenes limpias se toque (la de mas grano natural, `14.jpeg`, mide 0.012). Ademas el ruido se mide sobre la imagen completa y no sobre la region con zoom: en un recorte pequeno, una textura fina (una malla, pelo) se confunde con ruido. El usuario tambien puede elegir la limpieza a mano: "Con ruido: limpiar" para ruido leve, y "JPEG muy comprimido" para suavizar bloques.
+
+![Con JPEG o ruido, la limpieza previa recupera la ventaja de RZI.](../figuras/ejemplos_robustez.png){width=95%}
+
+Resultados: con ruido de 0.02 RZI pasa de **-1.81 dB a +2.32 dB** con la limpieza automatica; con ruido leve (0.01) la limpieza manual lo lleva a +1.71 dB; con JPEG de calidad 50 la opcion manual lo lleva de -0.21 a +0.22 dB.
+
+## 10.4 Zoom real (sin verdad de campo)
+
+Las metricas necesitan la imagen original; en el uso real no existe. Por eso tambien revisamos a ojo el zoom x4 real sobre zonas con bordes de las imagenes del equipo: RZI define mejor los contornos que la bicubica, sin los bloques del vecino mas proximo y sin halos visibles.
+
+![Zoom x4 real: vecino, bicubica y RZI sobre imagenes del equipo.](../figuras/ejemplos_zoom_real.png){width=100%}
+
+# 11. Errores encontrados y corregidos
 
 Esta seccion es material valioso para la defensa: muestra que el equipo **verifico** su propio trabajo con datos.
 
@@ -404,22 +491,23 @@ Esta seccion es material valioso para la defensa: muestra que el equipo **verifi
 | Dos hilos llamando a Numba paralelo | Riesgo de cierre del programa | Candado (lock) en los kernels | Lupa y calculo seguros |
 | Refuerzo de bordes constante en cada ciclo | Con 30 ciclos: -5.6 dB de media | Refuerzo decreciente $\beta_k$ | Estable con cualquier numero de ciclos |
 | Reduccion silenciosa de regiones grandes | Salida mas pequena que la original | Procesamiento por bloques | Salida siempre de $hk \times wk$ |
+| RZI copiaba el ruido de la entrada | Con ruido 0.02: -1.8 dB frente a bicubica | Limpieza con variacion total | +2.3 dB frente a bicubica |
 | "Medir calidad" fallaba con fotos grandes | Error de tamanos en las metricas | Evaluar el recorte con mas detalle (512 px) | Funciona con cualquier foto |
 | Errores al mostrar resultados quedaban en silencio | Pestanas vacias sin mensaje | Errores visibles, registro y diagnostico | Siempre se ve que paso |
 
-Todo esto esta cubierto por pruebas automaticas (`python -m pytest tests`, 28 pruebas).
+Todo esto esta cubierto por pruebas automaticas (`python -m pytest tests`, 33 pruebas).
 
-# 11. Limitaciones (decirlas antes de que las pregunten)
+# 12. Limitaciones (decirlas antes de que las pregunten)
 
 1. **No inventa detalle que no existe.** Si una textura fina (pelo, letras pequenas) desaparecio al achicar, ningun metodo basado solo en la imagen puede recuperarla de forma exacta. RZI reconstruye mejor los **bordes**, no detalles perdidos.
 2. **Supone un modelo de degradacion.** Funciona mejor cuando la imagen se achico de forma parecida a la bicubica (seccion 9.3).
 3. **Ganancias moderadas.** Entre 0.6 y 1.7 dB sobre la bicubica es una mejora real y medible, pero no es "magia". Los metodos de inteligencia artificial (redes neuronales entrenadas con millones de imagenes) logran mas en PSNR o en apariencia, a costa de necesitar entrenamiento, GPU y de poder "alucinar" detalle falso.
-4. **Ruido.** Si la imagen pequena tiene mucho ruido, la back-projection lo respeta como si fuera informacion real.
+4. **Ruido y JPEG.** Sin limpieza, la back-projection copia el ruido y los bloques de JPEG. La limpieza automatica resuelve el ruido fuerte; el ruido leve y el JPEG requieren elegir la opcion a mano, y la mejora con JPEG es pequena (+0.2 dB).
 5. **Parametros ajustados en pocas imagenes.** Se eligieron con 4 imagenes estandar; otras imagenes podrian preferir otros valores.
 
-# 12. Guia de sustentacion {.salto}
+# 13. Guia de sustentacion {.salto}
 
-## 12.1 Guion de demostracion (unos 10 minutos)
+## 13.1 Guion de demostracion (unos 10 minutos)
 
 1. **(1 min) El problema.** Abrir una foto, hacer zoom con la rueda en el visor izquierdo hasta ver los bloques. "Esto es el zoom nativo: vecino mas proximo."
 2. **(2 min) Ampliar.** Pulsar *Ampliar region (RZI)*. En el dialogo, hacer zoom (los tres visores se mueven juntos) y comparar vecino, bicubica y RZI. Senalar la nitidez y la consistencia.
@@ -441,7 +529,7 @@ Todo esto esta cubierto por pruebas automaticas (`python -m pytest tests`, 28 pr
 
 ![Proceso paso a paso.](../figuras/app_animacion.png){width=100%}
 
-## 12.2 Preguntas probables y respuestas cortas
+## 13.2 Preguntas probables y respuestas cortas
 
 **1. Por que no usaron inteligencia artificial?**
 Porque el objetivo del curso son los metodos numericos. Ademas, RZI no necesita datos de entrenamiento ni GPU, es explicable linea por linea y no inventa detalle falso.
@@ -506,10 +594,13 @@ Porque con refuerzo constante el efecto se acumula y con muchos ciclos la imagen
 **21. Que pasa con fotos muy grandes?**
 Se procesan por bloques de 256 px con 16 px de solape y se mezclan con rampas. Funciona porque el metodo es local; el resultado coincide con el de la imagen completa.
 
-**22. Que mejorarian con mas tiempo?**
+**22. Que pasa si la foto tiene ruido o es un JPEG muy comprimido?**
+Sin limpieza, RZI copia el ruido (la back-projection lo trata como dato real). Por eso se mide el ruido en las zonas planas y, si es claro, se limpia antes con variacion total (modelo ROF, otra EDP). Con ruido de 0.02 pasa de -1.8 dB a +2.3 dB frente a la bicubica.
+
+**23. Que mejorarian con mas tiempo?**
 Estimar el nucleo de degradacion de cada imagen, usar multigrid para converger aun mas rapido, y un modo especifico para imagenes con ruido.
 
-## 12.3 Errores a evitar en la sustentacion
+## 13.3 Errores a evitar en la sustentacion
 
 - No decir que el metodo "recupera" detalles perdidos: reconstruye mejor los bordes.
 - No decir que el omega teorico de malla completa coincide con el empirico: ya demostramos que no (y por que).
@@ -517,7 +608,7 @@ Estimar el nucleo de degradacion de cada imagen, usar multigrid para converger a
 - No prometer resultados de IA: comparar con la bicubica y Lanczos, que son la referencia justa.
 - Tener la aplicacion abierta y el kernel de Numba ya compilado antes de empezar (la primera ejecucion tarda unos segundos extra).
 
-## 12.4 Glosario rapido
+## 13.4 Glosario rapido
 
 - **Back-projection:** correccion iterativa con el error al volver a achicar la imagen.
 - **Dirichlet (condicion de):** valor fijo en ciertos puntos de la malla.
@@ -534,7 +625,7 @@ Estimar el nucleo de degradacion de cada imagen, usar multigrid para converger a
 - **SOR:** sobre-relajacion sucesiva.
 - **Verdad de campo:** la imagen original contra la que se compara.
 
-## 12.5 Hoja de formulas
+## 13.5 Hoja de formulas
 
 | Concepto | Formula |
 |:---|:---|
@@ -549,9 +640,10 @@ Estimar el nucleo de degradacion de cada imagen, usar multigrid para converger a
 | Poisson screened | $(4 + \lambda)u_{i,j} - \sum \text{vecinos} = -\operatorname{div}(\mathbf{v}) + \lambda t$ |
 | Amplificacion | $s(x) = 1 + (\beta - 1)\,x/(x + \tau)$ |
 | Refuerzo del ciclo k | $\beta_k = 1 + (\beta - 1)\,\rho^k$ |
+| Variacion total (ROF) | $\min_u \sum \lVert \nabla u \rVert + \frac{1}{2p}\sum (u-f)^2$, con $p = 0.7\,\sigma$ |
 | PSNR | $10 \log_{10}(1/\text{MSE})$ |
 
-# 13. Arquitectura del software
+# 14. Arquitectura del software
 
 El codigo esta organizado en tres capas. Cada capa solo usa a la de abajo:
 
@@ -564,7 +656,9 @@ El codigo esta organizado en tres capas. Cada capa solo usa a la de abajo:
 Ademas:
 
 - `services/diagnostico.py` y `scripts/diagnostico.py`: revisan versiones y prueban cada herramienta sin interfaz (Ayuda > Diagnostico en la aplicacion).
-- `tests/`: 28 pruebas automaticas (matematica, solver, modelo, estabilidad, bloques, CSV e interfaz).
+- `core/denoise.py`: estimacion del ruido y limpieza con variacion total.
+- `scripts/evaluar_imagenes.py`: evaluacion con las imagenes del equipo (`imagenes_ejemplo/`).
+- `tests/`: 33 pruebas automaticas (matematica, solver, modelo, estabilidad, bloques, limpieza, CSV e interfaz).
 - `scripts/generar_resultados.py`: reproduce todas las tablas y figuras de este documento.
 - `docs/estudio/`: la fuente de este documento y el script que genera el PDF.
 

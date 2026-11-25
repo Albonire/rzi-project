@@ -215,3 +215,46 @@ def test_diagnostico_sin_errores():
     from services.diagnostico import ejecutar_diagnostico
     texto, ok = ejecutar_diagnostico()
     assert ok, texto
+
+
+def test_estimador_de_ruido(camara):
+    from core.denoise import estimar_ruido
+    assert estimar_ruido(camara) < 0.006
+    ruidosa = np.clip(camara + np.random.default_rng(8).normal(0, 0.02, camara.shape), 0, 1)
+    assert abs(estimar_ruido(ruidosa) - 0.02) < 0.004
+
+
+def test_limpieza_automatica_rescata_entrada_ruidosa(camara):
+    hr, lr = degradar(camara, 2)
+    lr = np.clip(lr + np.random.default_rng(9).normal(0, 0.02, lr.shape), 0, 1)
+    bic = psnr(hr, interpolacion_bicubica(lr, 2))
+    sin = upscale_rzi(lr, 2, limpieza='no')
+    auto = upscale_rzi(lr, 2, limpieza='auto')
+    assert auto['limpieza_aplicada'] == 'ruido'
+    assert psnr(hr, sin['imagen_recon']) < bic            # sin limpiar copia el ruido
+    assert psnr(hr, auto['imagen_recon']) > bic + 0.5      # limpiando supera a la bicubica
+
+
+def test_limpieza_automatica_no_toca_imagenes_limpias(camara):
+    hr, lr = degradar(camara, 2)
+    auto = upscale_rzi(lr, 2, ciclos=3)
+    sin = upscale_rzi(lr, 2, ciclos=3, limpieza='no')
+    assert auto['limpieza_aplicada'] == 'no'
+    assert np.array_equal(auto['imagen_recon'], sin['imagen_recon'])
+
+
+def test_region_pequena_no_se_limpia_sola_pero_si_con_sigma_global():
+    textura = np.random.default_rng(10).random((64, 64))     # parece "ruido"
+    assert upscale_rzi(textura, 2, ciclos=1)['limpieza_aplicada'] == 'no'
+    r = upscale_rzi(textura, 2, ciclos=1, sigma_ruido=0.03)
+    assert r['limpieza_aplicada'] == 'ruido'
+
+
+def test_animacion_con_limpieza_coincide_con_upscale(camara):
+    tile = np.clip(camara[100:228, 100:228]
+                   + np.random.default_rng(11).normal(0, 0.03, (128, 128)), 0, 1)
+    res = upscale(tile, 2, ciclos=2, sor_iters=40)
+    gen = generar_frames_pipeline(tile, 2, ciclos=2, sor_iters=40)
+    assert gen['limpieza_aplicada'] == 'ruido'
+    assert 'Limpieza de la entrada (variacion total)' in gen['pasos']
+    assert np.allclose(gen['frames'][-1], res['imagen_recon'], atol=1e-12)

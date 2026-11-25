@@ -22,6 +22,10 @@ RZI mejora PSNR, SSIM y GMSD en las 12 combinaciones imagen/factor y supera a La
 
 ![Comparacion x4](docs/figuras/comparacion_camera_x4.png)
 
+**Con las 25 imagenes del equipo** (`imagenes_ejemplo/`: fotos, arte digital, radiografia), RZI gana a la bicubica y a Lanczos en las 25, en x2 (+1.59 dB de media) y en x4 (+0.99 dB), y tambien en SSIM y GMSD. Se reproduce con `python scripts/evaluar_imagenes.py`.
+
+**Entrada con ruido o JPEG.** Si la imagen pequena trae ruido, la back-projection lo copiaba (con ruido de 0.02, RZI quedaba 1.8 dB por debajo de la bicubica). Ahora el ruido se mide en las zonas planas de la imagen completa y, si es claro (sigma > 0.013), se limpia antes con variacion total (modelo ROF): con ruido de 0.02 RZI queda +2.3 dB por encima de la bicubica. En imagenes limpias no se activa. El selector **Entrada** del panel permite forzar la limpieza de ruido leve o suavizar bloques de JPEG.
+
 ## El modelo
 
 Se alternan dos pasos (10 ciclos por defecto):
@@ -49,7 +53,7 @@ La malla esta centrada en pixeles (la salida mide exactamente `h*k x w*k`). A co
 | Nucleo | `core/` | `poisson_builder.py` (problemas y omega), `sor_solver.py` (kernels SOR Red-Black con Numba), `upscaler.py` (modelo RZI), `image_ops.py` (reescalado y color en float64). |
 | Servicios | `services/` | `metrics.py` (PSNR, SSIM, GMSD, nitidez, protocolo de degradacion), `exporter.py` (CSV y graficas), `diagnostico.py` (prueba cada herramienta). |
 
-Ademas: `tests/` (28 pruebas automaticas), `scripts/generar_resultados.py` (reproduce tablas y figuras), `scripts/diagnostico.py` (revisa el entorno) y `docs/estudio/` (fuente del documento PDF).
+Ademas: `core/denoise.py` (estimacion de ruido y variacion total), `tests/` (33 pruebas automaticas), `scripts/evaluar_imagenes.py` (evaluacion con `imagenes_ejemplo/`), `scripts/generar_resultados.py` (reproduce tablas y figuras), `scripts/diagnostico.py` (revisa el entorno) y `docs/estudio/` (fuente del documento PDF).
 
 ## Instalacion y uso
 

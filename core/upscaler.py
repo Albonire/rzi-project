@@ -43,6 +43,7 @@ from scipy.ndimage import minimum_filter, maximum_filter
 from core.image_ops import (resize_float, resize_rgb_float,
                             unsharp_mask_float, rgb_a_ycbcr, ycbcr_a_rgb)
 from core.poisson_builder import construir_problema_gradiente
+from core.denoise import preparar_entrada, limpiar
 from core.sor_solver import (resolver_screened, resolver_screened_con_snapshots,
                              CalculoCancelado)
 
@@ -147,7 +148,7 @@ def beta_ciclo(beta: float, rho: float, k: int) -> float:
 
 def _rzi_canal(f_lr, factor, lam, beta, tau, sigma, rho, ciclos, bp_final,
                sor_iters, tol, omega, realce, usar_anti_ringing,
-               al_paso=None, progreso=None, cancelado=None):
+               al_paso=None, progreso=None, cancelado=None, emitir_nn=True):
     """
     Ejecuta el modelo RZI sobre un canal 2D completo (sin control de tamano).
 
@@ -169,7 +170,7 @@ def _rzi_canal(f_lr, factor, lam, beta, tau, sigma, rho, ciclos, bp_final,
         if progreso is not None:
             progreso(frac, texto)
 
-    if al_paso is not None:
+    if al_paso is not None and emitir_nn:
         paso(resize_float(f_lr, W, H, Image.NEAREST), 'Vecino mas cercano (NN)',
              'Zoom nativo (NN): cada pixel original se replica en un bloque '
              f'de {factor}x{factor}. Sin suavizado ni nueva estructura.')
@@ -360,7 +361,8 @@ def upscale_rzi(tile: np.ndarray, factor: int = 4, lam: float = 0.2,
                 sor_iters: int = 150, tol: float = 1e-6, omega: float = None,
                 realce: float = 0.0, usar_anti_ringing: bool = False,
                 capturar_snapshots: bool = False, al_paso=None,
-                progreso=None, cancelado=None) -> dict:
+                progreso=None, cancelado=None, limpieza: str = 'auto',
+                sigma_ruido: float = None) -> dict:
     """
     Amplia una imagen en escala de grises 'factor' veces con el modelo RZI.
 
@@ -376,6 +378,10 @@ def upscale_rzi(tile: np.ndarray, factor: int = 4, lam: float = 0.2,
     omega     : None usa el omega optimo de la malla; un valor lo fuerza.
     realce    : 0..1, realce perceptual opcional (ver realce_perceptual).
     al_paso, progreso, cancelado : callbacks opcionales (ver _rzi_canal).
+    limpieza  : 'auto' (limpia solo si detecta ruido claro), 'ruido', 'jpeg'
+                o 'no'. Ver core/denoise.py.
+    sigma_ruido : ruido medido sobre la imagen completa (opcional; mas
+                confiable que medirlo en una region pequena).
 
     Las regiones cuya salida supera MAX_PIXELES_BLOQUE se procesan por
     bloques; las que superan MAX_PIXELES_SALIDA lanzan SalidaDemasiadoGrande.
@@ -386,6 +392,7 @@ def upscale_rzi(tile: np.ndarray, factor: int = 4, lam: float = 0.2,
         'error_datos'  : resumen del solver.
         'snapshots'    : estados intermedios si capturar_snapshots (o None).
         'por_bloques'  : True si se proceso por bloques.
+        'sigma_estimado', 'limpieza_aplicada' : ruido medido y limpieza usada.
         'tile_reducido': siempre False (se conserva por compatibilidad).
     """
     if tile.ndim != 2:
@@ -393,9 +400,10 @@ def upscale_rzi(tile: np.ndarray, factor: int = 4, lam: float = 0.2,
     factor = int(factor)
     if factor < 1:
         raise ValueError("El factor debe ser >= 1.")
-    f_lr = np.asarray(tile, dtype=np.float64)
-    h, w = f_lr.shape
+    f_original = np.asarray(tile, dtype=np.float64)
+    h, w = f_original.shape
     verificar_tamano(h, w, factor)
+    f_lr, sigma_est, aplicada = preparar_entrada(f_original, limpieza, sigma_ruido)
 
     params = dict(lam=lam, beta=beta, tau=tau, sigma=sigma, rho=rho, ciclos=ciclos,
                   bp_final=bp_final, sor_iters=sor_iters, tol=tol, omega=omega,
@@ -416,16 +424,29 @@ def upscale_rzi(tile: np.ndarray, factor: int = 4, lam: float = 0.2,
             previo = al_paso
 
             def al_paso(frame, nombre, texto, _previo=previo):
-                if not nombre.startswith('Vecino'):
+                if not nombre.startswith(('Vecino', 'Entrada', 'Limpieza')):
                     snapshots.append(np.clip(frame, 0.0, 1.0))
                 if _previo is not None:
                     _previo(frame, nombre, texto)
 
+        emitir_nn = True
+        if aplicada != 'no' and al_paso is not None:
+            H, W = h * factor, w * factor
+            al_paso(resize_float(f_original, W, H, Image.NEAREST), 'Entrada original',
+                    f'Imagen de entrada vista con zoom nativo. Ruido estimado en zonas planas: '
+                    f'sigma = {sigma_est:.4f}.')
+            texto = ('ruido' if aplicada == 'ruido' else 'bloques de JPEG')
+            al_paso(resize_float(f_lr, W, H, Image.NEAREST),
+                    'Limpieza de la entrada (variacion total)',
+                    f'Se limpia el {texto} con variacion total (modelo ROF): aplana el ruido '
+                    f'y conserva los bordes. Sin esto, la back-projection copiaria el ruido.')
+            emitir_nn = False
         res = _rzi_canal(f_lr, factor, al_paso=al_paso, progreso=progreso,
-                         cancelado=cancelado, **params)
+                         cancelado=cancelado, emitir_nn=emitir_nn, **params)
 
     res.update(snapshots=snapshots, por_bloques=grande, tile_reducido=False,
-               factor=factor, lam=float(lam))
+               factor=factor, lam=float(lam), sigma_estimado=sigma_est,
+               limpieza_aplicada=aplicada)
     return res
 
 
@@ -434,6 +455,15 @@ def _upscale_croma(c: np.ndarray, factor: int, n_bp: int = 3) -> np.ndarray:
     h, w = c.shape
     up = ampliar(c, w * factor, h * factor)
     return np.clip(back_projection(up, c, n_pass=n_bp), 0.0, 1.0)
+
+
+def _limpiar_croma(cb, cr, res) -> tuple:
+    """Aplica a Cb y Cr la misma limpieza que se uso en la luminancia."""
+    modo = res.get('limpieza_aplicada', 'no')
+    if modo == 'no':
+        return cb, cr
+    sigma = res.get('sigma_estimado', 0.0)
+    return limpiar(cb, modo, sigma), limpiar(cr, modo, sigma)
 
 
 def upscale(tile: np.ndarray, factor: int = 4, **kwargs) -> dict:
@@ -453,6 +483,7 @@ def upscale(tile: np.ndarray, factor: int = 4, **kwargs) -> dict:
     verificar_tamano(tile.shape[0], tile.shape[1], int(factor))
     y, cb, cr = rgb_a_ycbcr(tile[..., :3])
     res = upscale_rzi(y, factor, **kwargs)
+    cb, cr = _limpiar_croma(cb, cr, res)
     cb_up = _upscale_croma(cb, factor)
     cr_up = _upscale_croma(cr, factor)
 
@@ -496,7 +527,8 @@ def generar_frames_pipeline(tile: np.ndarray, factor: int = 4, progreso=None,
     if arr.ndim == 2:
         res = upscale_rzi(arr, factor, al_paso=al_paso, progreso=progreso,
                           cancelado=cancelado, **kwargs)
-        bicubica = frames[1]
+        h, w = arr.shape
+        bicubica = np.clip(resize_float(arr, w * factor, h * factor, Image.BICUBIC), 0, 1)
     else:
         rgb = arr[..., :3]
         verificar_tamano(rgb.shape[0], rgb.shape[1], factor)
@@ -505,14 +537,22 @@ def generar_frames_pipeline(tile: np.ndarray, factor: int = 4, progreso=None,
                           cancelado=cancelado, **kwargs)
         h, w = y.shape
         H, W = h * factor, w * factor
-        cb_up = _upscale_croma(cb, factor)
-        cr_up = _upscale_croma(cr, factor)
+        cb_l, cr_l = _limpiar_croma(cb, cr, res)
+        cb_up = _upscale_croma(cb_l, factor)
+        cr_up = _upscale_croma(cr_l, factor)
         frames = [ycbcr_a_rgb(fy, cb_up, cr_up) for fy in frames]
-        # los dos primeros frames (vecino y bicubica) se hacen directamente en
-        # RGB para que la comparacion visual sea fiel
-        frames[0] = resize_rgb_float(rgb, W, H, Image.NEAREST)
-        bicubica = resize_rgb_float(rgb, W, H, Image.BICUBIC)
-        frames[1] = bicubica
+        # los cuadros de la entrada original (vecino y bicubica) se hacen
+        # directamente en RGB para que la comparacion visual sea fiel
+        nn_rgb = resize_rgb_float(rgb, W, H, Image.NEAREST)
+        bic_rgb = resize_rgb_float(rgb, W, H, Image.BICUBIC)
+        sin_limpieza = res['limpieza_aplicada'] == 'no'
+        for i, pi in enumerate(pasos_idx):
+            nombre = pasos[pi]
+            if nombre == 'Entrada original' or (sin_limpieza and nombre.startswith('Vecino')):
+                frames[i] = nn_rgb
+            elif sin_limpieza and nombre.startswith('Bicubica inicial'):
+                frames[i] = bic_rgb
+        bicubica = bic_rgb
 
     return {
         'frames':         frames,
@@ -529,4 +569,6 @@ def generar_frames_pipeline(tile: np.ndarray, factor: int = 4, progreso=None,
         'ciclos':         int(kwargs.get('ciclos', PARAMS_DEFECTO['ciclos'])),
         'factor':         factor,
         'tile_reducido':  False,
+        'sigma_estimado': res['sigma_estimado'],
+        'limpieza_aplicada': res['limpieza_aplicada'],
     }
