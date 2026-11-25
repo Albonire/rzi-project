@@ -20,6 +20,7 @@ class VisorImagen(QGraphicsView):
     region_seleccionada = Signal(int, int, int, int)   # (x, y, w, h) en la imagen
     mouse_moved = Signal(int, int)                      # (x, y) en la imagen
     vista_cambiada = Signal()                           # zoom o desplazamiento
+    doble_clic = Signal()                               # doble clic sobre la imagen
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -217,6 +218,11 @@ class VisorImagen(QGraphicsView):
                 self._sel_rect = self._escena.addRect(rect, pen)
         else:
             super().mouseMoveEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if self._pixmap_item is not None and event.button() == Qt.LeftButton:
+            self.doble_clic.emit()
+        super().mouseDoubleClickEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
         if self._modo_sel and event.button() == Qt.LeftButton:

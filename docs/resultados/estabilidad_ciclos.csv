@@ -1,0 +1,13 @@
+variante,ciclos,ganancia_media,peor_caso
+Constante (anterior),2,0.851,0.468
+Constante (anterior),5,1.001,0.579
+Constante (anterior),10,1.086,0.555
+Constante (anterior),15,0.681,0.053
+Constante (anterior),20,-0.702,-3.779
+Constante (anterior),30,-5.602,-13.103
+Decreciente (actual),2,0.885,0.490
+Decreciente (actual),5,1.045,0.597
+Decreciente (actual),10,1.109,0.609
+Decreciente (actual),15,1.074,0.602
+Decreciente (actual),20,1.032,0.608
+Decreciente (actual),30,0.960,0.602

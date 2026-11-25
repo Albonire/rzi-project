@@ -29,16 +29,16 @@ date: "Noviembre de 2026"
 
 | Factor | Bicubica (PSNR) | Lanczos (PSNR) | **RZI (PSNR)** | Ganancia sobre bicubica |
 |:---:|:---:|:---:|:---:|:---:|
-| x2 | 30.90 dB | 31.30 dB | **32.17 dB** | **+1.27 dB** |
-| x3 | 28.46 dB | 28.73 dB | **29.44 dB** | **+0.98 dB** |
-| x4 | 27.00 dB | 27.25 dB | **28.01 dB** | **+1.01 dB** |
+| x2 | 30.90 dB | 31.30 dB | **32.16 dB** | **+1.26 dB** |
+| x3 | 28.46 dB | 28.73 dB | **29.48 dB** | **+1.02 dB** |
+| x4 | 27.00 dB | 27.25 dB | **28.05 dB** | **+1.05 dB** |
 
-RZI tambien gana en SSIM (estructura) y en GMSD (bordes) en **todas** las imagenes y factores probados, y produce bordes visiblemente mas nitidos (seccion 9).
+RZI tambien gana en SSIM (estructura) y en GMSD (bordes) en **todas** las imagenes y factores probados, supera a Lanczos en todos los casos, y produce bordes visiblemente mas nitidos (seccion 9). Ademas es **estable**: con cualquier numero de ciclos sigue mejorando a la bicubica (seccion 6.7).
 
 **Otros datos clave para la defensa:**
 
 - El omega optimo calculado con la mascara real reduce las iteraciones del solver clasico de unas 350 a solo 20 (factor 4).
-- Numba es unas 400 a 550 veces mas rapido que Python puro haciendo exactamente el mismo trabajo (la cifra exacta varia entre ejecuciones).
+- Numba es entre unas 250 y 550 veces mas rapido que Python puro haciendo exactamente el mismo trabajo (la cifra exacta varia entre ejecuciones y equipos).
 - No es inteligencia artificial: no hay entrenamiento ni datos externos. Todo sale de una ecuacion y de los pixeles de la propia imagen.
 
 # 2. El problema del zoom
@@ -232,17 +232,23 @@ $$\mathbf{v} = s\big(\lVert \nabla t \rVert\big)\,\nabla t, \qquad s(x) = 1 + (\
 
 ![La funcion de amplificacion: los gradientes pequenos (ruido, zonas planas) casi no cambian; los grandes (bordes reales) se multiplican hasta por beta.](../figuras/funcion_amplificacion.png){width=72%}
 
+**Refuerzo decreciente.** En cada ciclo $k$ (empezando en $k = 0$) el refuerzo maximo baja un poco:
+
+$$\beta_k = 1 + (\beta - 1)\,\rho^{\,k}, \qquad 0 < \rho < 1$$
+
+Con los valores por defecto ($\beta = 1.8$, $\rho = 0.93$) el primer ciclo refuerza hasta 1.8 veces, el quinto hasta 1.6 y el decimo hasta 1.4. La seccion 6.7 explica por que esto es indispensable.
+
 ## 6.3 El ciclo completo
 
 ![Esquema del metodo RZI.](../figuras/diagrama_metodo.png){width=100%}
 
 1. Empezar con la ampliacion bicubica $u_0$, de tamano exacto $kh \times kw$.
-2. Repetir 10 veces (los "ciclos"): back-projection para obtener $t$, y luego resolver la Poisson screened con SOR Red-Black.
+2. Repetir 10 veces (los "ciclos"): back-projection para obtener $t$, y luego resolver la Poisson screened con SOR Red-Black usando el refuerzo $\beta_k$ de ese ciclo.
 3. Terminar con 5 pasadas de back-projection, para que $\text{Down}(u)$ coincida con $f$ casi exactamente.
 
-Los valores por defecto ($\lambda = 0.3$, $\beta = 1.6$, $\tau = 0.05$, $\sigma = 0.6$, 10 ciclos) se eligieron midiendo la calidad promedio sobre las 4 imagenes de prueba en x2, x3 y x4. Los dos pasos se ayudan: la back-projection aporta la fidelidad a los datos y la EDP aporta bordes limpios sin ondas.
+Los valores por defecto ($\lambda = 0.2$, $\beta = 1.8$, $\rho = 0.93$, $\tau = 0.08$, $\sigma = 0.6$, 10 ciclos) se eligieron midiendo la calidad promedio y el peor caso sobre las 4 imagenes de prueba en x2, x3 y x4. Los dos pasos se ayudan: la back-projection aporta la fidelidad a los datos y la EDP aporta bordes limpios sin ondas.
 
-![Convergencia del modelo en "camera" x4. Izquierda: residuo del SOR (cada "diente" es un ciclo nuevo). Derecha: el error de consistencia Down(u) - f baja de 0.013 a menos de 0.001.](../figuras/convergencia_rzi.png){width=95%}
+![Convergencia del modelo en "camera" x4. Izquierda: residuo del SOR (cada "diente" es un ciclo nuevo). Derecha: el error de consistencia Down(u) - f, que termina muy por debajo del de la bicubica tras la back-projection final.](../figuras/convergencia_rzi.png){width=95%}
 
 ## 6.4 Malla centrada en pixeles
 
@@ -260,6 +266,34 @@ El ojo humano percibe la nitidez sobre todo en el **brillo** (luminancia) y much
 ## 6.6 Realce perceptual (opcional)
 
 La aplicacion incluye un control de "realce perceptual" (de 0 a 1, apagado por defecto). Aplica una mascara de enfoque controlada: recorta al rango local para no crear halos y despues reproyecta para no perder fidelidad. Marca mas los bordes a la vista, pero baja un poco el PSNR (unos 0.1 a 0.2 dB). Esta apagado por defecto porque **el objetivo principal es ser fiel a la imagen real**. Se puede mostrar en la sustentacion como opcion visual, aclarando ese costo.
+
+## 6.7 Estabilidad: por que el refuerzo debe decrecer
+
+En una version intermedia del proyecto el refuerzo $\beta$ era **constante** en todos los ciclos. Con 10 ciclos funcionaba bien, pero al medir con mas ciclos aparecio un problema serio: cada ciclo parte de una imagen cuyos bordes ya fueron reforzados y los vuelve a reforzar. El efecto se **acumula** (como un interes compuesto) hasta que los bordes se exageran y la imagen se degrada.
+
+| Ciclos | Refuerzo constante: media | Peor caso | Refuerzo decreciente: media | Peor caso |
+|:---:|:---:|:---:|:---:|:---:|
+| 5 | +1.00 dB | +0.58 dB | **+1.04 dB** | **+0.60 dB** |
+| 10 | +1.09 dB | +0.55 dB | **+1.11 dB** | **+0.61 dB** |
+| 15 | +0.68 dB | +0.05 dB | **+1.07 dB** | **+0.60 dB** |
+| 20 | -0.70 dB | -3.78 dB | **+1.03 dB** | **+0.61 dB** |
+| 30 | -5.60 dB | -13.10 dB | **+0.96 dB** | **+0.60 dB** |
+
+(Ganancia de PSNR sobre la bicubica; 12 casos: 4 imagenes en x2, x3 y x4.)
+
+![Con refuerzo constante (rojo) mas ciclos rompen la imagen; con refuerzo decreciente (verde) el metodo es estable.](../figuras/estabilidad_ciclos.png){width=85%}
+
+**Por que el refuerzo decreciente es estable.** El refuerzo total despues de muchos ciclos es aproximadamente el producto $\prod_k \beta_k$. Con $\beta$ constante ese producto crece sin limite ($1.6^{30}$ es enorme). Con $\beta_k = 1 + (\beta-1)\rho^k$ la suma $\sum_k (\beta-1)\rho^k = (\beta-1)/(1-\rho)$ es finita (es una serie geometrica), y por eso el producto tambien queda acotado: los bordes se refuerzan lo justo y despues el metodo se asienta. Es el mismo criterio de convergencia de las series que se ve en calculo.
+
+**Leccion para la defensa:** que un metodo iterativo funcione con los parametros por defecto no basta; hay que comprobar que **no diverge** si el usuario cambia el numero de iteraciones.
+
+## 6.8 Regiones grandes: procesamiento por bloques
+
+Ampliar una region de 1000 x 750 pixeles por 4 da una imagen de 12 megapixeles. Resolverla de una sola vez usa mucha memoria. La version anterior, en ese caso, **reducia la entrada sin avisar**, y el resultado podia salir incluso mas pequeno que la foto original. Eso tambien hacia fallar "Medir calidad" con fotos grandes.
+
+Ahora la region se divide en **bloques** de 256 x 256 pixeles de entrada que se solapan 16 pixeles con sus vecinos. Cada bloque se amplia con el metodo completo y en las zonas de solape los resultados se mezclan con pesos que pasan suavemente de un bloque al otro (rampas lineales). Funciona porque tanto la back-projection como el estencil de 5 puntos solo usan **vecinos cercanos**: lo que pasa a mas de 16 pixeles casi no influye. Medido: el resultado por bloques coincide con el de la imagen completa (diferencia maxima 0.009 en brillo, mismo PSNR).
+
+La salida siempre mide exactamente $hk \times wk$. Si superaria 25 megapixeles, la aplicacion lo dice antes de empezar e indica que hacer (zoom o factor menor).
 
 # 7. Aceleracion con Numba
 
@@ -280,9 +314,9 @@ La version anterior comparaba Numba (que ademas calculaba el residuo) contra un 
 
 | Malla | Python puro | Numba | Aceleracion |
 |:---:|:---:|:---:|:---:|
-| 64 x 64 | 0.108 s | 0.00020 s | 541 veces |
-| 128 x 128 | 0.506 s | 0.00094 s | 538 veces |
-| 256 x 256 | 1.665 s | 0.00421 s | 395 veces |
+| 64 x 64 | 0.093 s | 0.00020 s | 472 veces |
+| 128 x 128 | 0.392 s | 0.00079 s | 495 veces |
+| 256 x 256 | 1.594 s | 0.00654 s | 244 veces |
 
 ![Benchmark en escala logaritmica.](../figuras/benchmark.png){width=70%}
 
@@ -305,7 +339,7 @@ Para saber si una ampliacion es buena necesitamos saber como "deberia" verse. Po
 - **SSIM** (similitud estructural, de 0 a 1): compara brillo, contraste y forma en ventanas pequenas, de modo parecido a como mira el ojo. **Mayor es mejor.**
 - **GMSD** (desviacion de la similitud de magnitud de gradiente): compara los mapas de bordes. **Menor es mejor.** Es la metrica mas sensible a la nitidez.
 - **Nitidez** (magnitud media del gradiente): no necesita verdad de campo. Ojo: por si sola puede enganar, porque los bloques del vecino mas proximo tambien tienen gradientes grandes. Por eso se mira junto con las demas.
-- **Consistencia** (modo Reconstruir): PSNR entre la imagen ampliada vuelta a achicar y la original. Mide si la ampliacion respeta los datos reales.
+- **Consistencia** (modo Ampliar region): PSNR entre la imagen ampliada vuelta a achicar y la original. Mide si la ampliacion respeta los datos reales.
 
 # 9. Resultados {.salto}
 
@@ -313,20 +347,20 @@ Para saber si una ampliacion es buena necesitamos saber como "deberia" verse. Po
 
 | Imagen | Factor | Bicubica PSNR / SSIM | Lanczos PSNR | **RZI PSNR / SSIM** | GMSD bic. / **RZI** |
 |:---|:---:|:---:|:---:|:---:|:---:|
-| camera | x2 | 29.90 / 0.873 | 30.23 | **30.95 / 0.898** | 0.114 / **0.088** |
-| camera | x3 | 27.69 / 0.809 | 27.98 | **28.83 / 0.837** | 0.169 / **0.139** |
-| camera | x4 | 26.21 / 0.757 | 26.43 | **27.40 / 0.791** | 0.203 / **0.175** |
-| astronaut | x2 | 30.43 / 0.947 | 30.93 | **32.09 / 0.960** | 0.089 / **0.073** |
-| astronaut | x3 | 27.39 / 0.897 | 27.76 | **28.74 / 0.918** | 0.138 / **0.119** |
-| astronaut | x4 | 25.57 / 0.843 | 25.91 | **27.02 / 0.877** | 0.167 / **0.148** |
-| coffee | x2 | 29.26 / 0.885 | 29.66 | **30.59 / 0.916** | 0.105 / **0.074** |
-| coffee | x3 | 27.07 / 0.808 | 27.29 | **27.97 / 0.843** | 0.165 / **0.134** |
-| coffee | x4 | 25.97 / 0.752 | 26.14 | **26.77 / 0.788** | 0.196 / **0.171** |
-| chelsea | x2 | 34.02 / 0.921 | 34.37 | **35.04 / 0.942** | 0.083 / **0.064** |
-| chelsea | x3 | 31.67 / 0.860 | 31.88 | **32.22 / 0.883** | 0.132 / **0.113** |
-| chelsea | x4 | 30.28 / 0.808 | 30.53 | **30.86 / 0.834** | 0.161 / **0.145** |
+| camera | x2 | 29.90 / 0.873 | 30.23 | **30.94 / 0.898** | 0.114 / **0.088** |
+| camera | x3 | 27.69 / 0.809 | 27.98 | **28.86 / 0.837** | 0.169 / **0.138** |
+| camera | x4 | 26.21 / 0.757 | 26.43 | **27.42 / 0.790** | 0.203 / **0.173** |
+| astronaut | x2 | 30.43 / 0.947 | 30.93 | **32.11 / 0.961** | 0.089 / **0.072** |
+| astronaut | x3 | 27.39 / 0.897 | 27.76 | **28.85 / 0.920** | 0.138 / **0.117** |
+| astronaut | x4 | 25.57 / 0.843 | 25.91 | **27.09 / 0.879** | 0.167 / **0.144** |
+| coffee | x2 | 29.26 / 0.885 | 29.66 | **30.54 / 0.916** | 0.105 / **0.074** |
+| coffee | x3 | 27.07 / 0.808 | 27.29 | **27.95 / 0.842** | 0.165 / **0.134** |
+| coffee | x4 | 25.97 / 0.752 | 26.14 | **26.76 / 0.787** | 0.196 / **0.170** |
+| chelsea | x2 | 34.02 / 0.921 | 34.37 | **35.06 / 0.942** | 0.083 / **0.063** |
+| chelsea | x3 | 31.67 / 0.860 | 31.88 | **32.27 / 0.884** | 0.132 / **0.112** |
+| chelsea | x4 | 30.28 / 0.808 | 30.53 | **30.92 / 0.835** | 0.161 / **0.142** |
 
-RZI gana en las 12 combinaciones y en las tres metricas. La ganancia va de +0.55 dB (chelsea x3, una imagen muy suave con poco detalle que recuperar) a +1.66 dB (astronaut x2). Tiempo tipico: entre 0.1 y 0.5 s por imagen de 512 x 512 en un computador comun.
+RZI gana en las 12 combinaciones y en las tres metricas, y tambien supera a Lanczos en todas. La ganancia va de +0.61 dB (chelsea x3, una imagen muy suave con poco detalle que recuperar) a +1.68 dB (astronaut x2). Tiempo tipico: entre 0.1 y 0.5 s por imagen de 512 x 512 en un computador comun.
 
 ![Ganancia de PSNR de RZI sobre la bicubica, por imagen y factor.](../figuras/ganancia_psnr.png){width=85%}
 
@@ -346,10 +380,10 @@ El modelo supone que la imagen pequena se obtuvo con un nucleo bicubico (el oper
 
 | Como se achico la imagen | Ganancia media sobre bicubica | Peor caso |
 |:---|:---:|:---:|
-| Bicubica (lo que supone el modelo) | +1.14 dB | +0.58 dB |
-| Lanczos | +0.80 dB | +0.29 dB |
-| Desenfoque gaussiano + submuestreo | +0.66 dB | +0.40 dB |
-| Promedio de area (box) | +0.40 dB | +0.04 dB |
+| Bicubica (supuesta por el modelo) | +1.15 dB | +0.64 dB |
+| Lanczos | +0.83 dB | +0.37 dB |
+| Desenfoque gaussiano | +0.65 dB | +0.39 dB |
+| Promedio de area (box) | +0.49 dB | +0.14 dB |
 
 Conclusion honesta: RZI **sigue ganando** aunque el modelo de degradacion no sea exacto, pero gana menos. Esto es esperable y conviene decirlo en la sustentacion.
 
@@ -368,14 +402,18 @@ Esta seccion es material valioso para la defensa: muestra que el equipo **verifi
 | Modulo `metodos/` roto | `import metodos` fallaba | Eliminado | Repositorio limpio |
 | Visor suavizaba el zoom | El zoom nativo no mostraba bloques | Vecino mas proximo al acercar | Se ven los pixeles reales |
 | Dos hilos llamando a Numba paralelo | Riesgo de cierre del programa | Candado (lock) en los kernels | Lupa y calculo seguros |
+| Refuerzo de bordes constante en cada ciclo | Con 30 ciclos: -5.6 dB de media | Refuerzo decreciente $\beta_k$ | Estable con cualquier numero de ciclos |
+| Reduccion silenciosa de regiones grandes | Salida mas pequena que la original | Procesamiento por bloques | Salida siempre de $hk \times wk$ |
+| "Medir calidad" fallaba con fotos grandes | Error de tamanos en las metricas | Evaluar el recorte con mas detalle (512 px) | Funciona con cualquier foto |
+| Errores al mostrar resultados quedaban en silencio | Pestanas vacias sin mensaje | Errores visibles, registro y diagnostico | Siempre se ve que paso |
 
-Todo esto esta cubierto por pruebas automaticas (`python -m pytest tests`, 15 pruebas).
+Todo esto esta cubierto por pruebas automaticas (`python -m pytest tests`, 28 pruebas).
 
 # 11. Limitaciones (decirlas antes de que las pregunten)
 
 1. **No inventa detalle que no existe.** Si una textura fina (pelo, letras pequenas) desaparecio al achicar, ningun metodo basado solo en la imagen puede recuperarla de forma exacta. RZI reconstruye mejor los **bordes**, no detalles perdidos.
 2. **Supone un modelo de degradacion.** Funciona mejor cuando la imagen se achico de forma parecida a la bicubica (seccion 9.3).
-3. **Ganancias moderadas.** Entre 0.5 y 1.7 dB sobre la bicubica es una mejora real y medible, pero no es "magia". Los metodos de inteligencia artificial (redes neuronales entrenadas con millones de imagenes) logran mas en PSNR o en apariencia, a costa de necesitar entrenamiento, GPU y de poder "alucinar" detalle falso.
+3. **Ganancias moderadas.** Entre 0.6 y 1.7 dB sobre la bicubica es una mejora real y medible, pero no es "magia". Los metodos de inteligencia artificial (redes neuronales entrenadas con millones de imagenes) logran mas en PSNR o en apariencia, a costa de necesitar entrenamiento, GPU y de poder "alucinar" detalle falso.
 4. **Ruido.** Si la imagen pequena tiene mucho ruido, la back-projection lo respeta como si fuera informacion real.
 5. **Parametros ajustados en pocas imagenes.** Se eligieron con 4 imagenes estandar; otras imagenes podrian preferir otros valores.
 
@@ -384,16 +422,24 @@ Todo esto esta cubierto por pruebas automaticas (`python -m pytest tests`, 15 pr
 ## 12.1 Guion de demostracion (unos 10 minutos)
 
 1. **(1 min) El problema.** Abrir una foto, hacer zoom con la rueda en el visor izquierdo hasta ver los bloques. "Esto es el zoom nativo: vecino mas proximo."
-2. **(2 min) Reconstruir.** Pulsar *Reconstruir (RZI)*. En el dialogo, hacer zoom (los tres visores se mueven juntos) y comparar vecino, bicubica y RZI. Senalar la nitidez y la consistencia.
-3. **(2 min) Comparar modelos.** Alejar el zoom, pulsar *Comparar modelos*. Leer la tabla: PSNR, SSIM y GMSD de bicubica, Lanczos y RZI. Mencionar el protocolo de verdad de campo.
-4. **(1 min) Animar convergencia.** Mostrar como la imagen pasa de bicubica a RZI ciclo a ciclo.
+2. **(2 min) Ampliar.** Pulsar *Ampliar region (RZI)*. En el dialogo, hacer zoom (los tres visores se mueven juntos) y comparar vecino, bicubica y RZI. Senalar la nitidez y la consistencia.
+3. **(2 min) Medir calidad.** Pulsar *Medir calidad (comparar)*. Leer la tabla: PSNR, SSIM y GMSD de bicubica, Lanczos y RZI (la mejor fila sale en negrita). Mencionar el protocolo de verdad de campo.
+4. **(1 min) Ver el proceso paso a paso.** Mostrar como la imagen pasa de vecino y bicubica a RZI, etapa por etapa (lista de etapas a la izquierda).
 5. **(2 min) Barrido de omega.** Mostrar la curva en V: el omega estimado coincide con el minimo y la formula de malla completa no. Explicar por que (seccion 5.4).
 6. **(1 min) Benchmark.** Numba frente a Python con el mismo trabajo.
 7. **(1 min) Cierre.** Limitaciones y que se corrigio respecto a la version anterior.
 
-![La aplicacion despues de "Comparar modelos".](../figuras/app_comparar.png){width=100%}
+**Antes de empezar:** abra la aplicacion con anticipacion (la primera vez Numba compila unos segundos) y ejecute *Ayuda > Diagnostico* para confirmar que todo funciona en el equipo de la sustentacion. *Archivo > Imagenes de ejemplo* trae imagenes listas para la demo.
 
-![Dialogo de comparacion en detalle (modo Reconstruir).](../figuras/app_detalle.png){width=100%}
+![La aplicacion al iniciar: guia de 3 pasos y textos de ayuda en cada panel.](../figuras/app_inicio.png){width=100%}
+
+![Despues de "Ampliar region": visor derecho con el resultado y grafica de convergencia.](../figuras/app_reconstruir.png){width=100%}
+
+![La aplicacion despues de "Medir calidad (comparar)".](../figuras/app_comparar.png){width=100%}
+
+![Dialogo de comparacion en detalle (Ampliar region).](../figuras/app_detalle.png){width=100%}
+
+![Proceso paso a paso.](../figuras/app_animacion.png){width=100%}
 
 ## 12.2 Preguntas probables y respuestas cortas
 
@@ -437,7 +483,7 @@ El peso de "no alejarse de $t$". Con $\lambda$ grande manda $t$; con $\lambda$ p
 $\beta$ es cuanto se refuerzan los bordes fuertes (1 = nada). $\tau$ es el umbral que separa "borde" de "ruido": por debajo de $\tau$ casi no se amplifica.
 
 **14. Que es Numba y cuanto acelera?**
-Un compilador JIT que traduce funciones de Python a codigo maquina. Con el mismo trabajo, unas 400 a 550 veces mas rapido en nuestras pruebas.
+Un compilador JIT que traduce funciones de Python a codigo maquina. Con el mismo trabajo, entre unas 250 y 550 veces mas rapido en nuestras pruebas (varia entre ejecuciones).
 
 **15. Como saben que la mejora es real y no solo "se ve mas nitido"?**
 Por el protocolo de verdad de campo: tenemos la imagen original y medimos PSNR, SSIM y GMSD. RZI gana en las 12 combinaciones probadas.
@@ -454,7 +500,13 @@ Se separa brillo (Y) y color (Cb, Cr). El brillo pasa por RZI y el color por bic
 **19. Cual es la complejidad del metodo?**
 Cada iteracion SOR recorre todos los pixeles una vez: es lineal en el numero de pixeles, $O(N)$. El total es $O(N \cdot \text{ciclos} \cdot \text{iteraciones por ciclo})$; en la practica unas 160 iteraciones en total.
 
-**20. Que mejorarian con mas tiempo?**
+**20. Por que el refuerzo de bordes decrece en cada ciclo?**
+Porque con refuerzo constante el efecto se acumula y con muchos ciclos la imagen se rompe (-5.6 dB con 30 ciclos). Con $\beta_k = 1 + (\beta-1)\rho^k$ el refuerzo total queda acotado (serie geometrica) y el metodo es estable.
+
+**21. Que pasa con fotos muy grandes?**
+Se procesan por bloques de 256 px con 16 px de solape y se mezclan con rampas. Funciona porque el metodo es local; el resultado coincide con el de la imagen completa.
+
+**22. Que mejorarian con mas tiempo?**
 Estimar el nucleo de degradacion de cada imagen, usar multigrid para converger aun mas rapido, y un modo especifico para imagenes con ruido.
 
 ## 12.3 Errores a evitar en la sustentacion
@@ -496,6 +548,7 @@ Estimar el nucleo de degradacion de cada imagen, usar multigrid para converger a
 | Energia RZI | $E(u) = \lambda \lVert u - t \rVert^2 + \lVert \nabla u - \mathbf{v} \rVert^2$ |
 | Poisson screened | $(4 + \lambda)u_{i,j} - \sum \text{vecinos} = -\operatorname{div}(\mathbf{v}) + \lambda t$ |
 | Amplificacion | $s(x) = 1 + (\beta - 1)\,x/(x + \tau)$ |
+| Refuerzo del ciclo k | $\beta_k = 1 + (\beta - 1)\,\rho^k$ |
 | PSNR | $10 \log_{10}(1/\text{MSE})$ |
 
 # 13. Arquitectura del software
@@ -510,7 +563,8 @@ El codigo esta organizado en tres capas. Cada capa solo usa a la de abajo:
 
 Ademas:
 
-- `tests/`: 15 pruebas automaticas (matematica, solver, modelo, CSV e interfaz).
+- `services/diagnostico.py` y `scripts/diagnostico.py`: revisan versiones y prueban cada herramienta sin interfaz (Ayuda > Diagnostico en la aplicacion).
+- `tests/`: 28 pruebas automaticas (matematica, solver, modelo, estabilidad, bloques, CSV e interfaz).
 - `scripts/generar_resultados.py`: reproduce todas las tablas y figuras de este documento.
 - `docs/estudio/`: la fuente de este documento y el script que genera el PDF.
 
@@ -521,6 +575,7 @@ pip install -r requirements.txt
 python main.py
 python -m pytest tests
 python scripts/generar_resultados.py
+python scripts/diagnostico.py
 ```
 
 # Referencias

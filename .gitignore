@@ -45,3 +45,6 @@ core.[0-9]*
 # Intermedios del documento
 docs/estudio/*.docx
 docs/estudio/documento.html
+
+# Registro de errores de la aplicacion
+rzi_errores.log

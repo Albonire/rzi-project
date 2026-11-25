@@ -26,6 +26,8 @@ from core.sor_solver import (resolver, resolver_screened,
                              barrido_omega, benchmark_numba_vs_python)
 from core.upscaler import (upscale, upscale_rzi, generar_frames_pipeline,
                            back_projection, error_consistencia)
+from core import upscaler as modulo_upscaler
+from core.sor_solver import CalculoCancelado
 from services.metrics import (degradar, interpolacion_bicubica, psnr, ssim, gmsd,
                               tabla_comparativa)
 from services.exporter import exportar_csv
@@ -162,3 +164,54 @@ def test_generar_frames_pipeline_coincide_con_upscale(camara):
     gen_rgb = generar_frames_pipeline(rgb, 2, ciclos=2, sor_iters=40)
     assert gen_rgb['frames'][-1].shape == (24, 28, 3)
     assert np.allclose(gen_rgb['frames'][-1], res_rgb['imagen_recon'], atol=1e-12)
+
+
+@pytest.mark.parametrize('factor', [2, 4])
+def test_estable_con_muchos_ciclos(camara, factor):
+    # con amplificacion constante (rho=1) 30 ciclos rompian la imagen (-6 dB en
+    # promedio); con amplificacion decreciente sigue por encima de la bicubica
+    hr, lr = degradar(camara, factor)
+    bic = psnr(hr, interpolacion_bicubica(lr, factor))
+    assert psnr(hr, upscale_rzi(lr, factor, ciclos=30)['imagen_recon']) > bic + 0.5
+
+
+def test_por_bloques_igual_que_completo(camara, monkeypatch):
+    hr, lr = degradar(camara[:256, :256], 2)
+    completo = upscale_rzi(lr, 2, ciclos=3)
+    monkeypatch.setattr(modulo_upscaler, 'MAX_PIXELES_BLOQUE', 5_000)
+    monkeypatch.setattr(modulo_upscaler, 'BLOQUE_LR', 48)
+    bloques = upscale_rzi(lr, 2, ciclos=3)
+    assert bloques['por_bloques'] and bloques['bloques'] > 1
+    assert bloques['imagen_recon'].shape == completo['imagen_recon'].shape
+    assert abs(psnr(hr, bloques['imagen_recon']) - psnr(hr, completo['imagen_recon'])) < 0.1
+
+
+def test_region_grande_sale_del_tamano_exacto():
+    lr = np.random.default_rng(5).random((600, 450))   # salida 4.3 MP > 4 MP
+    r = upscale_rzi(lr, 4, ciclos=1, sor_iters=20, bp_final=1)
+    assert r['por_bloques']
+    assert r["imagen_recon"].shape == (2400, 1800)
+
+
+def test_salida_demasiado_grande_da_mensaje_claro():
+    with pytest.raises(modulo_upscaler.SalidaDemasiadoGrande, match='MP'):
+        upscale(np.zeros((3000, 4000, 3)), 2)
+
+
+def test_cancelacion():
+    lr = np.random.default_rng(6).random((40, 40))
+    with pytest.raises(CalculoCancelado):
+        upscale_rzi(lr, 2, cancelado=lambda: True)
+
+
+def test_progreso_llega_a_uno():
+    avances = []
+    upscale_rzi(np.random.default_rng(7).random((30, 30)), 2, ciclos=3,
+                progreso=lambda f, t: avances.append(f))
+    assert avances and avances[-1] == 1.0 and avances == sorted(avances)
+
+
+def test_diagnostico_sin_errores():
+    from services.diagnostico import ejecutar_diagnostico
+    texto, ok = ejecutar_diagnostico()
+    assert ok, texto
