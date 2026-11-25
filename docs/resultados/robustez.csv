@@ -1,5 +1,5 @@
 degradacion,ganancia_media_vs_bicubica,ganancia_min_vs_bicubica,ganancia_media_vs_lanczos
-Bicubica (supuesta por el modelo),1.136,0.582,0.816
-Lanczos,0.795,0.288,0.500
-Desenfoque gaussiano,0.658,0.401,0.457
-Promedio de area (box),0.405,0.037,0.161
+Bicubica (supuesta por el modelo),1.150,0.637,0.830
+Lanczos,0.833,0.366,0.538
+Desenfoque gaussiano,0.652,0.389,0.451
+Promedio de area (box),0.488,0.140,0.244

@@ -424,11 +424,62 @@ def figuras_didacticas():
     guardar(fig, 'diagrama_metodo.png')
 
 
+def estabilidad():
+    """
+    Ganancia sobre la bicubica segun el numero de ciclos, con amplificacion
+    constante (version anterior: beta=1.6, tau=0.05, rho=1) y decreciente
+    (version actual, valores por defecto).
+    """
+    print('Estabilidad frente al numero de ciclos...')
+    variantes = {
+        'Constante (anterior)': dict(lam=0.3, beta=1.6, tau=0.05, rho=1.0),
+        'Decreciente (actual)': dict(),
+    }
+    lista_ciclos = (2, 5, 10, 15, 20, 30)
+    casos = []
+    for img in IMAGENES.values():
+        for f in (2, 3, 4):
+            hr, lr = degradar(img, f)
+            casos.append((hr, lr, f, psnr(hr, interpolacion_bicubica(lr, f))))
+    filas = []
+    for nombre, kw in variantes.items():
+        for c in lista_ciclos:
+            g = [psnr(hr, upscale_rzi(lr, f, ciclos=c, **kw)['imagen_recon']) - pb
+                 for hr, lr, f, pb in casos]
+            filas.append({'variante': nombre, 'ciclos': c,
+                          'ganancia_media': float(np.mean(g)), 'peor_caso': float(np.min(g))})
+            print(f'  {nombre:<22} ciclos {c:>2}: media {np.mean(g):+.2f} dB, '
+                  f'peor {np.min(g):+.2f} dB', flush=True)
+    with open(os.path.join(RES, 'estabilidad_ciclos.csv'), 'w', newline='') as fh:
+        w = csv.DictWriter(fh, fieldnames=list(filas[0].keys()))
+        w.writeheader()
+        for fi in filas:
+            w.writerow({k: (f'{v:.3f}' if isinstance(v, float) else v) for k, v in fi.items()})
+
+    fig, ax = plt.subplots(figsize=(8.5, 4.6))
+    for (nombre, color) in (('Constante (anterior)', ROJO), ('Decreciente (actual)', VERDE)):
+        sel = [fi for fi in filas if fi['variante'] == nombre]
+        ax.plot([fi['ciclos'] for fi in sel], [fi['ganancia_media'] for fi in sel], 'o-',
+                color=color, linewidth=2, label=f'{nombre}: media')
+        ax.plot([fi['ciclos'] for fi in sel], [fi['peor_caso'] for fi in sel], 's--',
+                color=color, linewidth=1.2, alpha=0.7, label=f'{nombre}: peor caso')
+    ax.axhline(0, color='black', linewidth=0.8)
+    ax.axvline(10, color=GRIS, linestyle=':', label='10 ciclos (por defecto)')
+    ax.set_xlabel('Numero de ciclos')
+    ax.set_ylabel('Ganancia de PSNR sobre la bicubica (dB)')
+    ax.set_title('Estabilidad: con refuerzo constante, mas ciclos rompen la imagen')
+    ax.legend(fontsize=8, loc='lower left')
+    ax.grid(linestyle=':', alpha=0.6)
+    guardar(fig, 'estabilidad_ciclos.png')
+    return filas
+
+
 def main():
     t0 = time.time()
     filas = tabla_principal()
     resumen = resumen_ganancias(filas)
     rob = robustez()
+    estabilidad()
     comparacion_visual()
     r, filas_omega, bench = omega_y_benchmark()
     figuras_didacticas()

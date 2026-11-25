@@ -14,6 +14,7 @@ from PIL import Image
 # El backend de matplotlib lo elige quien importa este modulo: la interfaz
 # usa QtAgg y los scripts/pruebas usan Agg (sin ventana).
 import matplotlib.pyplot as plt
+from matplotlib.backends.backend_agg import FigureCanvasAgg
 
 
 AZUL, ROSA, VERDE, NARANJA, GRIS = '#2196F3', '#E91E63', '#4CAF50', '#FF9800', '#9E9E9E'
@@ -57,6 +58,22 @@ def exportar_csv(tabla: list, resultado_solver: dict, ruta: str) -> None:
 
 # Graficas
 
+def figura_a_imagen(fig, dpi: float = 110) -> np.ndarray:
+    """
+    Dibuja una figura de matplotlib a un array RGB float [0,1].
+    No depende del backend activo (usa Agg directamente), asi funciona igual
+    en la interfaz, en los scripts y en las pruebas.
+    """
+    dpi_original = fig.get_dpi()
+    fig.set_dpi(dpi)
+    try:
+        canvas = FigureCanvasAgg(fig)
+        canvas.draw()
+        return np.asarray(canvas.buffer_rgba())[..., :3].astype(np.float64) / 255.0
+    finally:
+        fig.set_dpi(dpi_original)
+
+
 def _guardar(fig, ruta):
     if ruta:
         fig.savefig(ruta, dpi=150, bbox_inches='tight')
@@ -66,7 +83,7 @@ def _guardar(fig, ruta):
 
 def grafica_convergencia(historial: np.ndarray, omega: float,
                          error_datos: np.ndarray = None,
-                         ruta: str = None) -> plt.Figure:
+                         ruta: str = None, compacta: bool = False) -> plt.Figure:
     """
     Izquierda: residuo relativo del SOR en todas sus iteraciones (cada
     "diente" es un ciclo del modelo, que arranca de una nueva estimacion).
@@ -74,7 +91,10 @@ def grafica_convergencia(historial: np.ndarray, omega: float,
     despues de cada ciclo, que debe bajar.
     """
     n = 2 if error_datos is not None and len(error_datos) > 1 else 1
-    fig, ejes = plt.subplots(1, n, figsize=(6 * n, 4.2))
+    if compacta:   # panel lateral angosto: una grafica debajo de la otra
+        fig, ejes = plt.subplots(n, 1, figsize=(5.2, 3.0 * n))
+    else:
+        fig, ejes = plt.subplots(1, n, figsize=(6 * n, 4.2))
     ejes = np.atleast_1d(ejes)
 
     ax = ejes[0]
@@ -103,13 +123,13 @@ def grafica_convergencia(historial: np.ndarray, omega: float,
 
 def grafica_barrido_omega(omegas: list, iteraciones: list, omega_teorico: float,
                           omega_malla_completa: float = None,
-                          ruta: str = None) -> plt.Figure:
+                          ruta: str = None, compacta: bool = False) -> plt.Figure:
     """
     Curva Iteraciones vs Omega (forma de V). Marca el minimo empirico, el
     omega estimado con la mascara (Young + metodo de la potencia) y, como
     referencia, el de la formula de malla completa.
     """
-    fig, ax = plt.subplots(figsize=(9, 5))
+    fig, ax = plt.subplots(figsize=(5.6, 4.0) if compacta else (9, 5))
     ax.plot(omegas, iteraciones, 'o-', color=AZUL, linewidth=2, markersize=4,
             label='Iteraciones medidas')
     idx = int(np.argmin(iteraciones))
@@ -148,7 +168,8 @@ def elegir_recorte(img: np.ndarray, lado: int) -> tuple:
 
 def grafica_comparacion(original: np.ndarray, candidatas: dict, tabla: list = None,
                         recorte: tuple = None, columnas: int = 3,
-                        ruta: str = None, factor_eval: int = None) -> plt.Figure:
+                        ruta: str = None, factor_eval: int = None,
+                        compacta: bool = False) -> plt.Figure:
     """
     Cuadricula de comparacion. El primer panel es la verdad de campo completa
     con un recuadro que marca la zona de detalle; los demas muestran ESE
@@ -172,7 +193,9 @@ def grafica_comparacion(original: np.ndarray, candidatas: dict, tabla: list = No
     n = len(paneles)
     columnas = min(columnas, n)
     filas = int(np.ceil(n / columnas))
-    fig, ejes = plt.subplots(filas, columnas, figsize=(3.6 * columnas, 3.9 * filas),
+    lado_panel = 2.0 if compacta else 3.6
+    fig, ejes = plt.subplots(filas, columnas,
+                             figsize=(lado_panel * columnas, (lado_panel + 0.35) * filas),
                              squeeze=False)
 
     for k, (nombre, img, completa) in enumerate(paneles):
@@ -190,7 +213,7 @@ def grafica_comparacion(original: np.ndarray, candidatas: dict, tabla: list = No
         if nombre in metricas:
             m = metricas[nombre]
             titulo += f"\nPSNR {m['psnr']:.2f} dB | SSIM {m['ssim']:.3f}"
-        ax.set_title(titulo, fontsize=11)
+        ax.set_title(titulo, fontsize=8 if compacta else 11)
         ax.axis('off')
     for k in range(n, filas * columnas):
         ejes[k // columnas, k % columnas].axis('off')
@@ -202,13 +225,14 @@ def grafica_comparacion(original: np.ndarray, candidatas: dict, tabla: list = No
     return _guardar(fig, ruta)
 
 
-def grafica_benchmark(resultados: list, ruta: str = None) -> plt.Figure:
+def grafica_benchmark(resultados: list, ruta: str = None,
+                      compacta: bool = False) -> plt.Figure:
     """Barras de tiempo Python puro vs Numba por tamano de malla (log)."""
     tamanios = [f"{r['forma'][0]}x{r['forma'][1]}" for r in resultados]
     t_numba = [r['tiempo_numba'] for r in resultados]
     t_python = [r['tiempo_python'] for r in resultados]
     x = np.arange(len(tamanios))
-    fig, ax = plt.subplots(figsize=(8, 5))
+    fig, ax = plt.subplots(figsize=(5.6, 4.0) if compacta else (8, 5))
     ax.bar(x - 0.2, t_python, 0.38, label='Python puro', color=NARANJA)
     ax.bar(x + 0.2, t_numba, 0.38, label='Numba @njit', color=AZUL)
     for i, r in enumerate(resultados):

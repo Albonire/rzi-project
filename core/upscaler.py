@@ -18,10 +18,18 @@ alternando dos pasos:
      (ver core.poisson_builder.amplified_guidance). La ecuacion limpia el
      "ringing" que deja la back-projection y mantiene los bordes nitidos.
 
+Amplificacion decreciente: en el ciclo k se usa
+    beta_k = 1 + (beta - 1) * rho^k      (0 < rho < 1)
+Si beta fuera constante, el refuerzo se acumularia ciclo tras ciclo y con
+muchos ciclos la imagen se "rompe" (se midio: -6 dB con 30 ciclos). Con
+beta_k decreciente el refuerzo total queda acotado y el metodo es estable
+con cualquier numero de ciclos.
+
 Se repite 'ciclos' veces y se termina con unas pasadas de back-projection.
 
 La malla esta centrada en pixeles: la salida mide exactamente
-(h*factor, w*factor), sin estirar ni recortar nada.
+(h*factor, w*factor), sin estirar ni recortar nada. Las regiones grandes se
+procesan por bloques con solape (ver _upscale_por_bloques).
 
 Imagenes a color: se procesa la luminancia Y (donde el ojo percibe la
 nitidez) con el modelo completo, y la crominancia (Cb, Cr) con bicubica mas
@@ -35,15 +43,45 @@ from scipy.ndimage import minimum_filter, maximum_filter
 from core.image_ops import (resize_float, resize_rgb_float,
                             unsharp_mask_float, rgb_a_ycbcr, ycbcr_a_rgb)
 from core.poisson_builder import construir_problema_gradiente
-from core.sor_solver import resolver_screened, resolver_screened_con_snapshots
+from core.sor_solver import (resolver_screened, resolver_screened_con_snapshots,
+                             CalculoCancelado)
 
-# Tope de tamano de salida (pixeles) para no saturar memoria ni tiempo.
-MAX_PIXELES_SALIDA = 4_000_000
+# Hasta este tamano de salida (pixeles) se resuelve de una sola vez.
+MAX_PIXELES_BLOQUE = 4_000_000
+# Por encima, se procesa por bloques; mas alla de este tope no se procesa
+# (memoria y tiempo) y se pide al usuario una region mas pequena.
+MAX_PIXELES_SALIDA = 25_000_000
+# Bloques: lado del nucleo y solape, en pixeles de la imagen pequena.
+BLOQUE_LR = 256
+SOLAPE_LR = 16
 
 # Valores por defecto ajustados con scripts/generar_resultados.py
 # (4 imagenes de prueba, factores x2, x3 y x4).
-PARAMS_DEFECTO = dict(lam=0.3, beta=1.6, tau=0.05, sigma=0.6, ciclos=10,
-                      bp_final=5, sor_iters=150, tol=1e-6)
+PARAMS_DEFECTO = dict(lam=0.2, beta=1.8, tau=0.08, sigma=0.6, rho=0.93,
+                      ciclos=10, bp_final=5, sor_iters=150, tol=1e-6)
+
+
+class SalidaDemasiadoGrande(ValueError):
+    """La imagen de salida superaria MAX_PIXELES_SALIDA."""
+
+
+def factor_maximo(h: int, w: int) -> int:
+    """Mayor factor entero cuya salida cabe en MAX_PIXELES_SALIDA (0 si ninguno)."""
+    k = int(np.sqrt(MAX_PIXELES_SALIDA / max(1, h * w)))
+    return k if k >= 2 else 0
+
+
+def verificar_tamano(h: int, w: int, factor: int) -> None:
+    """Lanza SalidaDemasiadoGrande con un mensaje claro si la salida no cabe."""
+    salida = h * w * factor * factor
+    if salida > MAX_PIXELES_SALIDA:
+        fmax = factor_maximo(h, w)
+        sugerencia = (f'Use factor {fmax} o menor, o haga zoom sobre una zona mas pequena.'
+                      if fmax else 'Haga zoom sobre una zona mas pequena.')
+        raise SalidaDemasiadoGrande(
+            f'La region de {w}x{h} px ampliada x{factor} daria '
+            f'{w * factor}x{h * factor} px ({salida / 1e6:.0f} MP); el maximo es '
+            f'{MAX_PIXELES_SALIDA / 1e6:.0f} MP. {sugerencia}')
 
 
 def reducir(u: np.ndarray, w: int, h: int) -> np.ndarray:
@@ -100,25 +138,229 @@ def realce_perceptual(u: np.ndarray, f_lr: np.ndarray, fuerza: float) -> np.ndar
     return np.clip(back_projection(v, f_lr, n_pass=2), 0.0, 1.0)
 
 
-def _ajustar_tamano(tile: np.ndarray, factor: int) -> tuple:
-    """Si la salida superaria MAX_PIXELES_SALIDA, reduce el tile de entrada."""
-    h, w = tile.shape[:2]
-    if h * w * factor * factor <= MAX_PIXELES_SALIDA:
-        return tile, False
-    escala = np.sqrt(MAX_PIXELES_SALIDA / (h * w * factor * factor))
-    nw, nh = max(8, int(w * escala)), max(8, int(h * escala))
-    if tile.ndim == 2:
-        return np.clip(resize_float(tile, nw, nh, Image.LANCZOS), 0, 1), True
-    canales = [resize_float(tile[..., c], nw, nh, Image.LANCZOS) for c in range(3)]
-    return np.clip(np.stack(canales, axis=-1), 0, 1), True
+def beta_ciclo(beta: float, rho: float, k: int) -> float:
+    """Amplificacion del ciclo k (k = 0, 1, ...): 1 + (beta - 1) * rho^k."""
+    return 1.0 + (beta - 1.0) * (rho ** k)
 
 
-def upscale_rzi(tile: np.ndarray, factor: int = 4, lam: float = 0.3,
-                beta: float = 1.6, tau: float = 0.05, sigma: float = 0.6,
-                ciclos: int = 10, bp_final: int = 5, sor_iters: int = 150,
-                tol: float = 1e-6, omega: float = None, realce: float = 0.0,
-                usar_anti_ringing: bool = False,
-                capturar_snapshots: bool = False) -> dict:
+# Pipeline de un bloque
+
+def _rzi_canal(f_lr, factor, lam, beta, tau, sigma, rho, ciclos, bp_final,
+               sor_iters, tol, omega, realce, usar_anti_ringing,
+               al_paso=None, progreso=None, cancelado=None):
+    """
+    Ejecuta el modelo RZI sobre un canal 2D completo (sin control de tamano).
+
+    al_paso(frame, paso, subtitulo): se llama en cada etapa (animacion).
+    progreso(fraccion, texto): avance entre 0 y 1.
+    cancelado(): si devuelve True se lanza CalculoCancelado.
+    """
+    h, w = f_lr.shape
+    H, W = h * factor, w * factor
+    n_ciclos = int(ciclos)
+
+    def paso(frame, nombre, texto):
+        if al_paso is not None:
+            al_paso(frame, nombre, texto)
+
+    def revisar(frac, texto):
+        if cancelado is not None and cancelado():
+            raise CalculoCancelado()
+        if progreso is not None:
+            progreso(frac, texto)
+
+    if al_paso is not None:
+        paso(resize_float(f_lr, W, H, Image.NEAREST), 'Vecino mas cercano (NN)',
+             'Zoom nativo (NN): cada pixel original se replica en un bloque '
+             f'de {factor}x{factor}. Sin suavizado ni nueva estructura.')
+
+    u = np.clip(ampliar(f_lr, W, H), 0.0, 1.0)
+    err0 = error_consistencia(u, f_lr)
+    error_datos = [err0]
+    paso(u, 'Bicubica inicial (u0)',
+         f'Guia inicial bicubica u0 (tamano exacto {W}x{H}). Elimina bloques pero '
+         f'suaviza bordes | error ||Down(u0)-f|| = {err0:.5f}.')
+
+    historial = []
+    iteraciones = 0
+    tiempo = 0.0
+    convergio = True
+    omega_usado = omega
+
+    if factor > 1:
+        for c in range(1, n_ciclos + 1):
+            revisar((c - 1) / (n_ciclos + 1), f'Ciclo {c} de {n_ciclos}')
+            t = back_projection(u, f_lr, n_pass=1)
+            b_k = beta_ciclo(beta, rho, c - 1)
+            problema = construir_problema_gradiente(t, lam=lam, beta=b_k,
+                                                    tau=tau, sigma=sigma)
+
+            if c <= 2 or n_ciclos <= 5:
+                nombre_c = f'Ciclo {c}: BP + SOR Red-Black'
+            else:
+                nombre_c = f'Ciclos 3..{n_ciclos}: refinamiento iterativo'
+            if c <= 2 and al_paso is not None:
+                err_bp = error_consistencia(np.clip(t, 0.0, 1.0), f_lr)
+                paso(t, nombre_c,
+                     f'Ciclo {c}/{n_ciclos} - Back-projection: t = u + Up(f - Down(u)) | '
+                     f'||Down(t)-f|| = {err_bp:.5f}. Recupera datos pero deja ondas.')
+
+            if c == 1 and al_paso is not None:
+                cada = max(8, int(sor_iters) // 4)
+                res = resolver_screened_con_snapshots(problema, omega=omega, tol=tol,
+                                                      max_iter=sor_iters, cada_n_iter=cada)
+                snaps = res['snapshots']
+                for i in range(min(3, len(snaps) - 1)):
+                    it_aprox = min(res['iteraciones'], (i + 1) * cada)
+                    paso(snaps[i], nombre_c,
+                         f'Ciclo 1 - SOR Red-Black (iter {it_aprox}, omega={res["omega"]:.3f}, '
+                         f'beta={b_k:.2f}): (4+lam)*u - vecinos = -div(v) + lam*t.')
+            else:
+                res = resolver_screened(problema, omega=omega, tol=tol, max_iter=sor_iters)
+
+            u = res['imagen_recon']
+            iteraciones += res['iteraciones']
+            tiempo += res['tiempo']
+            convergio = convergio and res['convergio']
+            omega_usado = res['omega']
+            historial.extend(res['historial'].tolist())
+            err_c = error_consistencia(u, f_lr)
+            error_datos.append(err_c)
+            paso(u, nombre_c,
+                 f'Ciclo {c}/{n_ciclos} completado ({res["iteraciones"]} iters SOR, '
+                 f'omega={res["omega"]:.3f}, beta={b_k:.2f}) | ||Down(u)-f|| = {err_c:.5f}.')
+
+        revisar(n_ciclos / (n_ciclos + 1), 'Back-projection final')
+        if int(bp_final) > 0:
+            u = back_projection(u, f_lr, n_pass=int(bp_final))
+            paso(u, 'Back-projection final',
+                 f'Back-projection final ({int(bp_final)} pasadas): ajusta la consistencia '
+                 f'con la imagen original | ||Down(u)-f|| = '
+                 f'{error_consistencia(np.clip(u, 0.0, 1.0), f_lr):.5f}.')
+
+        if usar_anti_ringing:
+            u = anti_ringing(u, np.clip(ampliar(f_lr, W, H), 0.0, 1.0))
+            paso(u, 'Anti-ringing',
+                 'Recorte local 3x3 contra la guia bicubica: acota posibles halos '
+                 'cerca de bordes de alto contraste.')
+
+        u = np.clip(u, 0.0, 1.0)
+        if realce > 0:
+            u = realce_perceptual(u, f_lr, realce)
+            paso(u, 'Realce perceptual',
+                 f'Realce perceptual (fuerza={realce:.2f}): USM acotado en 3x3 + '
+                 f'2 pasadas de back-projection para mayor contraste visual.')
+        error_datos.append(error_consistencia(u, f_lr))
+
+    u = np.clip(u, 0.0, 1.0)
+    paso(u, 'Reconstruccion final',
+         f'Resultado final RZI ({W}x{H} px) | error de consistencia ||Down(u)-f|| = '
+         f'{error_datos[-1]:.5f} (desde {err0:.5f} en bicubica).')
+    if progreso is not None:
+        progreso(1.0, 'Listo')
+
+    return {
+        'imagen_recon': u,
+        'iteraciones':  int(iteraciones),
+        'tiempo':       float(tiempo),
+        'omega':        float(omega_usado) if omega_usado is not None else float('nan'),
+        'convergio':    bool(convergio),
+        'historial':    np.asarray(historial, dtype=np.float64),
+        'error_datos':  np.asarray(error_datos, dtype=np.float64),
+    }
+
+
+# Procesamiento por bloques
+
+def _rampa(n: int, solape: int, inicio_libre: bool, fin_libre: bool) -> np.ndarray:
+    """Peso 1D: sube linealmente en el solape de los bordes compartidos."""
+    w = np.ones(n, dtype=np.float64)
+    if solape > 0:
+        r = (np.arange(solape) + 0.5) / solape
+        if not inicio_libre:
+            w[:solape] = r
+        if not fin_libre:
+            w[-solape:] = np.minimum(w[-solape:], r[::-1])
+    return w
+
+
+def _cortes(n: int, bloque: int, solape: int) -> list:
+    """Intervalos [a, b) que cubren 0..n con nucleos de 'bloque' y solape."""
+    if n <= bloque + 2 * solape:
+        return [(0, n)]
+    cortes = []
+    inicio = 0
+    while inicio < n:
+        fin = min(n, inicio + bloque)
+        cortes.append((max(0, inicio - solape), min(n, fin + solape)))
+        inicio = fin
+    return cortes
+
+
+def _upscale_por_bloques(f_lr, factor, params, progreso=None, cancelado=None):
+    """
+    Amplia una imagen grande por bloques con solape y mezcla con rampas.
+
+    La back-projection y el SOR solo usan vecinos cercanos, asi que cada
+    bloque, con unos pixeles de solape, da practicamente el mismo resultado
+    que resolver la imagen completa. Las rampas lineales en el solape evitan
+    costuras visibles.
+    """
+    h, w = f_lr.shape
+    H, W = h * factor, w * factor
+    acumulado = np.zeros((H, W), dtype=np.float64)
+    pesos = np.zeros((H, W), dtype=np.float64)
+    filas = _cortes(h, BLOQUE_LR, SOLAPE_LR)
+    cols = _cortes(w, BLOQUE_LR, SOLAPE_LR)
+    total = len(filas) * len(cols)
+    sol = SOLAPE_LR * factor
+
+    resumen = dict(iteraciones=0, tiempo=0.0, convergio=True, omega=float('nan'))
+    errores, historial = [], []
+    n = 0
+    for (y0, y1) in filas:
+        for (x0, x1) in cols:
+            base = n / total
+
+            def prog(frac, texto, base=base):
+                if progreso is not None:
+                    progreso(base + frac / total, f'Bloque {n + 1} de {total}: {texto}')
+
+            r = _rzi_canal(f_lr[y0:y1, x0:x1], factor, progreso=prog,
+                           cancelado=cancelado, **params)
+            wy = _rampa((y1 - y0) * factor, sol, y0 == 0, y1 == h)
+            wx = _rampa((x1 - x0) * factor, sol, x0 == 0, x1 == w)
+            peso = np.outer(wy, wx)
+            acumulado[y0 * factor:y1 * factor, x0 * factor:x1 * factor] += peso * r['imagen_recon']
+            pesos[y0 * factor:y1 * factor, x0 * factor:x1 * factor] += peso
+            resumen['iteraciones'] += r['iteraciones']
+            resumen['tiempo'] += r['tiempo']
+            resumen['convergio'] = resumen['convergio'] and r['convergio']
+            resumen['omega'] = r['omega']
+            errores.append(r['error_datos'])
+            if not historial:
+                historial = r['historial'].tolist()
+            n += 1
+
+    u = np.clip(acumulado / np.maximum(pesos, 1e-12), 0.0, 1.0)
+    resumen.update(
+        imagen_recon=u,
+        historial=np.asarray(historial, dtype=np.float64),
+        error_datos=np.mean(np.stack(errores), axis=0),
+        bloques=total,
+    )
+    return resumen
+
+
+# API publica
+
+def upscale_rzi(tile: np.ndarray, factor: int = 4, lam: float = 0.2,
+                beta: float = 1.8, tau: float = 0.08, sigma: float = 0.6,
+                rho: float = 0.93, ciclos: int = 10, bp_final: int = 5,
+                sor_iters: int = 150, tol: float = 1e-6, omega: float = None,
+                realce: float = 0.0, usar_anti_ringing: bool = False,
+                capturar_snapshots: bool = False, al_paso=None,
+                progreso=None, cancelado=None) -> dict:
     """
     Amplia una imagen en escala de grises 'factor' veces con el modelo RZI.
 
@@ -127,84 +369,64 @@ def upscale_rzi(tile: np.ndarray, factor: int = 4, lam: float = 0.3,
     tile      : ndarray float64 [0,1], forma (h, w).
     factor    : factor de ampliacion entero (>= 1).
     lam       : peso de fidelidad del Poisson screened.
-    beta, tau : amplificacion de bordes (beta=1 desactiva la amplificacion).
+    beta, tau : amplificacion de bordes del primer ciclo (beta=1 la desactiva).
+    rho       : decaimiento de la amplificacion por ciclo (0 < rho <= 1).
     ciclos    : cuantas veces se alterna back-projection + SOR.
     bp_final  : pasadas finales de back-projection.
     omega     : None usa el omega optimo de la malla; un valor lo fuerza.
     realce    : 0..1, realce perceptual opcional (ver realce_perceptual).
+    al_paso, progreso, cancelado : callbacks opcionales (ver _rzi_canal).
+
+    Las regiones cuya salida supera MAX_PIXELES_BLOQUE se procesan por
+    bloques; las que superan MAX_PIXELES_SALIDA lanzan SalidaDemasiadoGrande.
 
     Retorna dict con:
-        'imagen_recon'    : ndarray (h*factor, w*factor) en [0,1].
-        'iteraciones'     : total de iteraciones SOR.
-        'tiempo'          : segundos dentro del solver SOR.
-        'omega'           : omega usado.
-        'convergio'       : True si todos los SOR alcanzaron la tolerancia.
-        'historial'       : residuo relativo de todas las iteraciones SOR.
-        'error_datos'     : error RMS ||Down(u) - f|| tras cada ciclo.
-        'snapshots'       : estados intermedios (o None).
-        'tile_reducido'   : True si se redujo la entrada por el tope de memoria.
+        'imagen_recon' : ndarray (h*factor, w*factor) en [0,1].
+        'iteraciones', 'tiempo', 'omega', 'convergio', 'historial',
+        'error_datos'  : resumen del solver.
+        'snapshots'    : estados intermedios si capturar_snapshots (o None).
+        'por_bloques'  : True si se proceso por bloques.
+        'tile_reducido': siempre False (se conserva por compatibilidad).
     """
     if tile.ndim != 2:
         raise ValueError("upscale_rzi espera un canal 2D; use upscale() para color.")
     factor = int(factor)
     if factor < 1:
         raise ValueError("El factor debe ser >= 1.")
-
-    f_lr, reducido = _ajustar_tamano(np.asarray(tile, dtype=np.float64), factor)
+    f_lr = np.asarray(tile, dtype=np.float64)
     h, w = f_lr.shape
-    H, W = h * factor, w * factor
+    verificar_tamano(h, w, factor)
 
-    u = np.clip(ampliar(f_lr, W, H), 0.0, 1.0)
-    snapshots = [u.copy()] if capturar_snapshots else None
-    error_datos = [error_consistencia(u, f_lr)]
-    historial = []
-    iteraciones = 0
-    tiempo = 0.0
-    convergio = True
-    omega_usado = omega
+    params = dict(lam=lam, beta=beta, tau=tau, sigma=sigma, rho=rho, ciclos=ciclos,
+                  bp_final=bp_final, sor_iters=sor_iters, tol=tol, omega=omega,
+                  realce=realce, usar_anti_ringing=usar_anti_ringing)
 
-    if factor > 1:
-        for _ in range(int(ciclos)):
-            t = back_projection(u, f_lr, n_pass=1)
-            problema = construir_problema_gradiente(t, lam=lam, beta=beta,
-                                                    tau=tau, sigma=sigma)
-            res = resolver_screened(problema, omega=omega, tol=tol,
-                                    max_iter=sor_iters)
-            u = res['imagen_recon']
-            iteraciones += res['iteraciones']
-            tiempo += res['tiempo']
-            convergio = convergio and res['convergio']
-            omega_usado = res['omega']
-            historial.extend(res['historial'].tolist())
-            error_datos.append(error_consistencia(u, f_lr))
-            if capturar_snapshots:
-                snapshots.append(np.clip(u, 0.0, 1.0))
+    grande = h * w * factor * factor > MAX_PIXELES_BLOQUE
+    if grande and (al_paso is not None or capturar_snapshots):
+        raise SalidaDemasiadoGrande(
+            'La animacion paso a paso necesita una region mas pequena '
+            f'(salida de hasta {MAX_PIXELES_BLOQUE / 1e6:.0f} MP). Haga zoom.')
 
-        u = back_projection(u, f_lr, n_pass=int(bp_final))
+    snapshots = None
+    if grande:
+        res = _upscale_por_bloques(f_lr, factor, params, progreso, cancelado)
+    else:
+        if capturar_snapshots:
+            snapshots = []
+            previo = al_paso
 
-        if usar_anti_ringing:
-            u = anti_ringing(u, np.clip(ampliar(f_lr, W, H), 0.0, 1.0))
-        u = np.clip(u, 0.0, 1.0)
-        u = realce_perceptual(u, f_lr, realce)
-        error_datos.append(error_consistencia(u, f_lr))
+            def al_paso(frame, nombre, texto, _previo=previo):
+                if not nombre.startswith('Vecino'):
+                    snapshots.append(np.clip(frame, 0.0, 1.0))
+                if _previo is not None:
+                    _previo(frame, nombre, texto)
 
-    u = np.clip(u, 0.0, 1.0)
-    if capturar_snapshots:
-        snapshots.append(u.copy())
+        res = _rzi_canal(f_lr, factor, al_paso=al_paso, progreso=progreso,
+                         cancelado=cancelado, **params)
 
-    return {
-        'imagen_recon':  u,
-        'iteraciones':   int(iteraciones),
-        'tiempo':        float(tiempo),
-        'omega':         float(omega_usado) if omega_usado is not None else float('nan'),
-        'convergio':     bool(convergio),
-        'historial':     np.asarray(historial, dtype=np.float64),
-        'error_datos':   np.asarray(error_datos, dtype=np.float64),
-        'snapshots':     snapshots,
-        'tile_reducido': reducido,
-        'factor':        factor,
-        'lam':           float(lam),
-    }
+    res.update(snapshots=snapshots, por_bloques=grande, tile_reducido=False,
+               factor=factor, lam=float(lam))
+    return res
 
 
 def _upscale_croma(c: np.ndarray, factor: int, n_bp: int = 3) -> np.ndarray:
@@ -228,10 +450,9 @@ def upscale(tile: np.ndarray, factor: int = 4, **kwargs) -> dict:
     if tile.ndim != 3 or tile.shape[2] < 3:
         raise ValueError("Se espera imagen 2D o RGB (h, w, 3).")
 
-    tile, reducido = _ajustar_tamano(tile[..., :3], factor)
-    y, cb, cr = rgb_a_ycbcr(tile)
+    verificar_tamano(tile.shape[0], tile.shape[1], int(factor))
+    y, cb, cr = rgb_a_ycbcr(tile[..., :3])
     res = upscale_rzi(y, factor, **kwargs)
-    res['tile_reducido'] = reducido
     cb_up = _upscale_croma(cb, factor)
     cr_up = _upscale_croma(cr, factor)
 
@@ -241,192 +462,71 @@ def upscale(tile: np.ndarray, factor: int = 4, **kwargs) -> dict:
     return res
 
 
-def _seleccionar_indices(n: int, maximo: int) -> list:
-    """Submuestrea indices conservando primero y ultimo."""
-    if n <= maximo:
-        return list(range(n))
-    sel = np.linspace(0, n - 1, maximo).round().astype(int)
-    return sorted(set(sel.tolist()))
+# Animacion didactica paso a paso
 
-
-def _generar_frames_canal(canal: np.ndarray, factor: int, lam: float, beta: float,
-                          tau: float, sigma: float, ciclos: int, bp_final: int,
-                          sor_iters: int, tol: float, omega: float,
-                          realce: float, usar_anti_ringing: bool) -> dict:
-    """Ejecuta el pipeline RZI sobre un canal 2D registrando pasos y subtitulos."""
-    f_lr = np.asarray(canal, dtype=np.float64)
-    h, w = f_lr.shape
-    H, W = h * factor, w * factor
-
-    frames, pasos, pasos_idx, subtitulos = [], [], [], []
-
-    def agregar(frame, paso, subtitulo):
-        if paso not in pasos:
-            pasos.append(paso)
-        pasos_idx.append(pasos.index(paso))
-        frames.append(np.clip(frame.astype(np.float64), 0.0, 1.0))
-        subtitulos.append(subtitulo)
-
-    # Fase 1: vecino mas cercano
-    nn = resize_float(f_lr, W, H, Image.NEAREST)
-    agregar(nn, 'Vecino mas cercano (NN)',
-            'Zoom nativo (NN): cada pixel original se replica en un bloque '
-            f'de {factor}x{factor}. Sin suavizado ni nueva estructura.')
-
-    # Fase 2: bicubica inicial (u0)
-    u = np.clip(ampliar(f_lr, W, H), 0.0, 1.0)
-    err0 = error_consistencia(u, f_lr)
-    error_datos = [err0]
-    agregar(u, 'Bicubica inicial (u0)',
-            f'Guia inicial bicubica u0 (tamano exacto {W}x{H}). Elimina '
-            f'bloques pero suaviza bordes | error ||Down(u0)-f|| = {err0:.5f}.')
-
-    iteraciones = 0
-    tiempo = 0.0
-    convergio = True
-    omega_usado = omega
-    historial = []
-    n_ciclos = int(ciclos)
-
-    if factor > 1:
-        cada_snap = max(8, int(sor_iters) // 4)
-        for c in range(1, n_ciclos + 1):
-            t = back_projection(u, f_lr, n_pass=1)
-            err_bp = error_consistencia(np.clip(t, 0.0, 1.0), f_lr)
-            problema = construir_problema_gradiente(t, lam=lam, beta=beta,
-                                                    tau=tau, sigma=sigma)
-
-            if c <= 2:
-                paso_c = f'Ciclo {c}: BP + SOR Red-Black'
-                agregar(t, paso_c,
-                        f'Ciclo {c}/{n_ciclos} - Back-projection: t = u + Up(f - Down(u)) | '
-                        f'||Down(t)-f|| = {err_bp:.5f}. Recupera datos pero deja ondas.')
-            elif n_ciclos <= 5:
-                paso_c = f'Ciclo {c}: BP + SOR Red-Black'
-            else:
-                paso_c = f'Ciclos 3..{n_ciclos}: refinamiento iterativo'
-
-            if c == 1:
-                res = resolver_screened_con_snapshots(
-                    problema, omega=omega, tol=tol, max_iter=sor_iters,
-                    cada_n_iter=cada_snap)
-                snaps = res['snapshots']
-                sel = _seleccionar_indices(len(snaps), 4)
-                omega_et = res['omega']
-                for idx_s in sel[:-1]:
-                    it_aprox = min(res['iteraciones'], (idx_s + 1) * cada_snap)
-                    agregar(snaps[idx_s], paso_c,
-                            f'Ciclo 1 - SOR Red-Black (iter {it_aprox}, omega={omega_et:.3f}): '
-                            f'(4+lam)*u - vecinos = -div(v) + lam*t.')
-            else:
-                res = resolver_screened(problema, omega=omega, tol=tol,
-                                        max_iter=sor_iters)
-
-            u = res['imagen_recon']
-            iteraciones += res['iteraciones']
-            tiempo += res['tiempo']
-            convergio = convergio and res['convergio']
-            omega_usado = res['omega']
-            historial.extend(res['historial'].tolist())
-
-            err_c = error_consistencia(u, f_lr)
-            error_datos.append(err_c)
-            agregar(u, paso_c,
-                    f'Ciclo {c}/{n_ciclos} completado ({res["iteraciones"]} iters SOR, '
-                    f'omega={res["omega"]:.3f}) | ||Down(u)-f|| = {err_c:.5f}.')
-
-        if int(bp_final) > 0:
-            u = back_projection(u, f_lr, n_pass=int(bp_final))
-            err_bpf = error_consistencia(np.clip(u, 0.0, 1.0), f_lr)
-            agregar(u, 'Back-projection final',
-                    f'Back-projection final ({int(bp_final)} pasadas): ajusta la '
-                    f'consistencia con la imagen original | ||Down(u)-f|| = {err_bpf:.5f}.')
-
-        if usar_anti_ringing:
-            u = anti_ringing(u, np.clip(ampliar(f_lr, W, H), 0.0, 1.0))
-            agregar(u, 'Anti-ringing',
-                    'Recorte local 3x3 contra la guia bicubica: acota posibles halos '
-                    'cerca de bordes de alto contraste.')
-
-        u = np.clip(u, 0.0, 1.0)
-        if realce > 0:
-            u = realce_perceptual(u, f_lr, realce)
-            agregar(u, 'Realce perceptual',
-                    f'Realce perceptual (fuerza={realce:.2f}): USM acotado en 3x3 + '
-                    f'2 pasadas de back-projection para mayor contraste visual.')
-
-        err_fin = error_consistencia(u, f_lr)
-        error_datos.append(err_fin)
-    else:
-        err_fin = err0
-
-    u = np.clip(u, 0.0, 1.0)
-    agregar(u, 'Reconstruccion final',
-            f'Resultado final RZI ({W}x{H} px) | error de consistencia '
-            f'||Down(u)-f|| = {err_fin:.5f} (desde {err0:.5f} en bicubica).')
-
-    return {
-        'frames':        frames,
-        'pasos':         pasos,
-        'pasos_de_frame': pasos_idx,
-        'subtitulos':    subtitulos,
-        'omega':         float(omega_usado) if omega_usado is not None else float('nan'),
-        'iteraciones':   int(iteraciones),
-        'tiempo':        float(tiempo),
-        'convergio':     bool(convergio),
-        'historial':     np.asarray(historial, dtype=np.float64),
-        'error_datos':   np.asarray(error_datos, dtype=np.float64),
-        'ciclos':        n_ciclos,
-        'factor':        factor,
-    }
-
-
-def generar_frames_pipeline(tile: np.ndarray, factor: int = 4, lam: float = 0.3,
-                            beta: float = 1.6, tau: float = 0.05, sigma: float = 0.6,
-                            ciclos: int = 10, bp_final: int = 5, sor_iters: int = 150,
-                            tol: float = 1e-6, omega: float = None,
-                            realce: float = 0.0, usar_anti_ringing: bool = False) -> dict:
+def generar_frames_pipeline(tile: np.ndarray, factor: int = 4, progreso=None,
+                            cancelado=None, **kwargs) -> dict:
     """
     Genera la secuencia didactica completa paso a paso para "Animar convergencia".
 
-    Acepta imagen en escala de grises (h, w) o RGB (h, w, 3). El ultimo frame
-    es identico al resultado de upscale() con los mismos parametros.
+    Usa exactamente el mismo pipeline que upscale() (callback al_paso), asi
+    que el ultimo frame es identico al resultado de upscale() con los mismos
+    parametros. Acepta imagen en grises (h, w) o RGB (h, w, 3).
+
+    Retorna dict con 'frames', 'pasos', 'pasos_de_frame', 'subtitulos',
+    'bicubica' y el resumen del solver ('omega', 'iteraciones', 'tiempo',
+    'convergio', 'historial', 'error_datos', 'ciclos', 'factor').
     """
     factor = int(factor)
     if factor < 1:
         raise ValueError("El factor debe ser >= 1.")
-
     arr = np.asarray(tile, dtype=np.float64)
-    if arr.ndim == 2:
-        f_lr, reducido = _ajustar_tamano(arr, factor)
-        gen = _generar_frames_canal(
-            f_lr, factor, lam, beta, tau, sigma, ciclos, bp_final,
-            sor_iters, tol, omega, realce, usar_anti_ringing)
-        gen['tile_reducido'] = reducido
-        gen['bicubica'] = gen['frames'][1]
-        return gen
-
-    if arr.ndim != 3 or arr.shape[2] < 3:
+    if arr.ndim == 3 and (arr.shape[2] < 3):
         raise ValueError("Se espera imagen 2D o RGB (h, w, 3).")
 
-    rgb_lr, reducido = _ajustar_tamano(arr[..., :3], factor)
-    y, cb, cr = rgb_a_ycbcr(rgb_lr)
-    gen = _generar_frames_canal(
-        y, factor, lam, beta, tau, sigma, ciclos, bp_final,
-        sor_iters, tol, omega, realce, usar_anti_ringing)
+    frames, pasos, pasos_idx, subtitulos = [], [], [], []
 
-    h, w = y.shape
-    H, W = h * factor, w * factor
-    cb_up = _upscale_croma(cb, factor)
-    cr_up = _upscale_croma(cr, factor)
+    def al_paso(frame, paso, subtitulo):
+        if paso not in pasos:
+            pasos.append(paso)
+        pasos_idx.append(pasos.index(paso))
+        frames.append(np.clip(np.asarray(frame, dtype=np.float64), 0.0, 1.0))
+        subtitulos.append(subtitulo)
 
-    frames_rgb = [ycbcr_a_rgb(fy, cb_up, cr_up) for fy in gen['frames']]
-    # keep first NN and bicubic frames purely spatial on RGB so comparison is faithful
-    frames_rgb[0] = resize_rgb_float(rgb_lr, W, H, Image.NEAREST)
-    bic_rgb = resize_rgb_float(rgb_lr, W, H, Image.BICUBIC)
-    frames_rgb[1] = bic_rgb
+    if arr.ndim == 2:
+        res = upscale_rzi(arr, factor, al_paso=al_paso, progreso=progreso,
+                          cancelado=cancelado, **kwargs)
+        bicubica = frames[1]
+    else:
+        rgb = arr[..., :3]
+        verificar_tamano(rgb.shape[0], rgb.shape[1], factor)
+        y, cb, cr = rgb_a_ycbcr(rgb)
+        res = upscale_rzi(y, factor, al_paso=al_paso, progreso=progreso,
+                          cancelado=cancelado, **kwargs)
+        h, w = y.shape
+        H, W = h * factor, w * factor
+        cb_up = _upscale_croma(cb, factor)
+        cr_up = _upscale_croma(cr, factor)
+        frames = [ycbcr_a_rgb(fy, cb_up, cr_up) for fy in frames]
+        # los dos primeros frames (vecino y bicubica) se hacen directamente en
+        # RGB para que la comparacion visual sea fiel
+        frames[0] = resize_rgb_float(rgb, W, H, Image.NEAREST)
+        bicubica = resize_rgb_float(rgb, W, H, Image.BICUBIC)
+        frames[1] = bicubica
 
-    gen['frames'] = frames_rgb
-    gen['bicubica'] = bic_rgb
-    gen['tile_reducido'] = reducido
-    return gen
+    return {
+        'frames':         frames,
+        'pasos':          pasos,
+        'pasos_de_frame': pasos_idx,
+        'subtitulos':     subtitulos,
+        'bicubica':       bicubica,
+        'omega':          res['omega'],
+        'iteraciones':    res['iteraciones'],
+        'tiempo':         res['tiempo'],
+        'convergio':      res['convergio'],
+        'historial':      res['historial'],
+        'error_datos':    res['error_datos'],
+        'ciclos':         int(kwargs.get('ciclos', PARAMS_DEFECTO['ciclos'])),
+        'factor':         factor,
+        'tile_reducido':  False,
+    }

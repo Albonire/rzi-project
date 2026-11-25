@@ -40,7 +40,7 @@ def test_flujo_completo_de_la_interfaz(tmp_path):
     ventana = VentanaPrincipal()
     ventana.show()
     errores = []
-    ventana._en_error = errores.append
+    ventana._en_error = lambda resumen, detalle='': errores.append(resumen)
 
     rng = np.random.default_rng(0)
     x = np.linspace(0, 1, 160)
@@ -76,10 +76,73 @@ def test_flujo_completo_de_la_interfaz(tmp_path):
     ventana._barrido_omega()
     _esperar(app, ventana)
     assert PanelResultados.TAB_OMEGA in ventana.panel_res.figuras
+    # la pestana deja de mostrar el texto de "estado vacio" y muestra la grafica
+    assert ventana.panel_res.pilas[PanelResultados.TAB_OMEGA].currentIndex() == 1
+
+    ventana._benchmark()
+    _esperar(app, ventana)
+    assert PanelResultados.TAB_BENCH in ventana.panel_res.figuras
 
     ventana._animar_convergencia()
     _esperar(app, ventana)
 
     timer.stop()
     assert errores == []
+    ventana.close()
+
+
+def _ventana(app):
+    from ui.main_window import VentanaPrincipal, ESTILO
+    app.setStyleSheet(ESTILO)
+    ventana = VentanaPrincipal()
+    ventana.show()
+    return ventana
+
+
+def test_estados_vacios_y_presets():
+    from ui.main_window import PRESETS, PERSONALIZADO
+    app = QApplication.instance() or QApplication(sys.argv)
+    ventana = _ventana(app)
+    pr = ventana.panel_res
+    for idx in range(4):
+        assert pr.pilas[idx].currentIndex() == 0      # texto de ayuda visible
+    pp = ventana.panel_params
+    pp.combo_preset.setCurrentText('Rapido')
+    assert pp.obtener_params()['ciclos'] == PRESETS['Rapido']['ciclos']
+    pp.spin_beta.setValue(2.2)                         # cambio manual
+    assert pp.combo_preset.currentText() == PERSONALIZADO
+    ventana.close()
+
+
+def test_comparar_con_foto_grande(tmp_path):
+    """Antes fallaba con 'operands could not be broadcast' en fotos grandes."""
+    app = QApplication.instance() or QApplication(sys.argv)
+    ventana = _ventana(app)
+    errores = []
+    ventana._en_error = lambda resumen, detalle='': errores.append(resumen)
+    rng = np.random.default_rng(1)
+    base = rng.random((120, 160))
+    grande = np.asarray(Image.fromarray(np.uint8(base * 255)).resize((1600, 1200),
+                                                                     Image.BICUBIC))
+    ruta = tmp_path / 'grande.png'
+    Image.fromarray(grande).save(ruta)
+    ventana.cargar_imagen(str(ruta))
+    ventana._comparar()
+    _esperar(app, ventana)
+    assert errores == []
+    assert len(ventana._resultado['tabla']) == 4
+    assert ventana.panel_res.tabla.rowCount() == 4
+    ventana.close()
+
+
+def test_errores_en_slots_se_muestran(monkeypatch):
+    """Una excepcion al mostrar un resultado ya no queda en silencio."""
+    import ui.main_window as mw
+    app = QApplication.instance() or QApplication(sys.argv)
+    ventana = _ventana(app)
+    vistos = []
+    monkeypatch.setattr(mw, 'mostrar_error',
+                        lambda parent, titulo, resumen, detalle='': vistos.append(resumen))
+    ventana._en_barrido_terminado({'omegas': None})   # datos invalidos a proposito
+    assert len(vistos) == 1 and 'KeyError' in vistos[0]
     ventana.close()

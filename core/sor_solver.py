@@ -35,6 +35,10 @@ except ImportError:
         return decorador
 
 
+class CalculoCancelado(Exception):
+    """El usuario cancelo el calculo (lo lanzan los bucles largos)."""
+
+
 # La capa de hilos por defecto de Numba ("workqueue") no admite llamadas
 # simultaneas a funciones paralelas desde dos hilos de Python. La interfaz
 # puede lanzar la lupa y una reconstruccion a la vez, asi que los kernels se
@@ -281,7 +285,7 @@ def resolver_screened_con_snapshots(problema: dict, omega: float = None,
 
 
 def barrido_omega(problema: dict, tol: float = 1e-3, max_iter: int = 500,
-                  n_puntos: int = 39) -> dict:
+                  n_puntos: int = 39, progreso=None, cancelado=None) -> dict:
     """
     Resuelve el mismo problema con muchos valores de omega en [1.0, 1.99] y
     cuenta las iteraciones. La curva tiene forma de V y su minimo empirico
@@ -292,7 +296,11 @@ def barrido_omega(problema: dict, tol: float = 1e-3, max_iter: int = 500,
     """
     omegas = np.linspace(1.0, 1.99, n_puntos)
     iteraciones = []
-    for om in omegas:
+    for k, om in enumerate(omegas):
+        if cancelado is not None and cancelado():
+            raise CalculoCancelado()
+        if progreso is not None:
+            progreso(k / len(omegas), f'omega = {om:.3f} ({k + 1} de {len(omegas)})')
         res = resolver(problema, omega=float(om), tol=tol, max_iter=max_iter,
                        ecuacion='poisson')
         iteraciones.append(res['iteraciones'])
