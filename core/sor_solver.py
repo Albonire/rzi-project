@@ -1,25 +1,25 @@
 """
-Capa 2 - Solver SOR Red-Black con Numba.
+Capa 2 - Solver SOR Red-Black acelerado con Numba.
 
-Implementa el metodo Successive Over-Relaxation con ordenamiento Rojo-Negro
-(seccion 3 del documento de proyecto) utilizando el decorador @njit de Numba
-para compilacion a codigo maquina nativo.
+SOR (Successive Over-Relaxation) actualiza cada incognita con
+    u_nuevo = u + omega * (u_GaussSeidel - u)
+Con omega = 1 es Gauss-Seidel; con 1 < omega < 2 se "sobre-relaja" y, con el
+omega adecuado, converge muchisimo mas rapido.
 
-Enfoque Matrix-Free (seccion 2.2 y 4):
-  La matriz A NUNCA se construye en memoria. Se aplica el estencil de 5 puntos
-  directamente sobre la grilla 2D de pixeles. Esto elimina el riesgo de OOM
-  (seccion 4: 34 GB para una malla de 256x256 en formato denso).
+Enfoque matrix-free: la matriz A del sistema nunca se construye. El estencil
+de 5 puntos se aplica directamente sobre la malla 2D de pixeles, asi que la
+memoria usada es solo la de las imagenes (u, b, mascara).
 
-Ordenamiento Rojo-Negro (seccion 3.2):
-  Divide la malla como un tablero de ajedrez en dos conjuntos independientes.
-  Fase Roja actualiza simultaneamente todos los pixeles con (i+j) par.
-  Fase Negra actualiza simultaneamente todos los pixeles con (i+j) impar.
-  Esta separacion rompe la dependencia secuencial del SOR clasico y permite
-  que @njit compile el bucle a codigo LLVM nativo.
+Ordenamiento Rojo-Negro: la malla se pinta como un tablero de ajedrez. Un
+pixel rojo ((i+j) par) solo tiene vecinos negros y viceversa. Por eso todos
+los rojos se pueden actualizar a la vez (en paralelo) y despues todos los
+negros, sin condiciones de carrera.
 """
 
-import numpy as np
+import threading
 import time
+
+import numpy as np
 
 try:
     from numba import njit, prange
@@ -29,73 +29,64 @@ except ImportError:
     prange = range
 
     def njit(*args, **kwargs):
-        """Decorador no-op cuando Numba no esta instalado."""
+        """Decorador vacio cuando Numba no esta instalado."""
         def decorador(f):
             return f
         return decorador
 
 
+# La capa de hilos por defecto de Numba ("workqueue") no admite llamadas
+# simultaneas a funciones paralelas desde dos hilos de Python. La interfaz
+# puede lanzar la lupa y una reconstruccion a la vez, asi que los kernels se
+# ejecutan de a uno.
+_LOCK_KERNEL = threading.Lock()
+
+
 @njit(cache=True, fastmath=True)
 def _kernel_sor_rb(u, b, mascara, omega, max_iter, tol):
     """
-    Kernel SOR Red-Black compilado con @njit (Numba).
+    SOR Red-Black para 4*u - (vecinos) = b con pixeles fijos (mascara=True).
 
-    Parametros de entrada (todos arrays contiguos en memoria):
-      u        : float64 (nrows, ncols), estimacion inicial / solucion in-place
-      b        : float64 (nrows, ncols), termino independiente (divergencia Poisson)
-      mascara  : bool   (nrows, ncols), True donde el pixel es conocido (Dirichlet)
-      omega    : float64, factor de sobrerrelajacion en (1, 2)
-      max_iter : int, maximo de iteraciones
-      tol      : float64, tolerancia de convergencia (norma L2 del residuo)
-
-    Retorna:
-      u           : solucion final (modifica en-lugar)
-      iteraciones : int, iteraciones realizadas
-      convergio   : bool
-      historial   : array float64 con el residuo por iteracion
+    tol es sobre la norma L2 ABSOLUTA del residuo en los pixeles libres.
+    Retorna (u, iteraciones, convergio, historial_residuo).
     """
     nrows, ncols = u.shape
-    historial    = np.empty(max_iter, dtype=np.float64)
-    iteraciones  = max_iter
-    convergio    = False
+    historial = np.empty(max_iter, dtype=np.float64)
+    iteraciones = max_iter
+    convergio = False
 
     for k in range(max_iter):
-
-        # ---- Fase Roja: actualizar pixeles donde (i+j) es par ----
+        # Fase Roja: (i+j) par
         for i in range(1, nrows - 1):
-            j_inicio = 2 - (i % 2)   # 2 si fila par, 1 si fila impar
+            j_inicio = 2 - (i % 2)
             for j in range(j_inicio, ncols - 1, 2):
                 if not mascara[i, j]:
-                    u_gs = (u[i-1, j] + u[i+1, j]
-                            + u[i, j-1] + u[i, j+1]
+                    u_gs = (u[i-1, j] + u[i+1, j] + u[i, j-1] + u[i, j+1]
                             + b[i, j]) * 0.25
                     u[i, j] += omega * (u_gs - u[i, j])
 
-        # ---- Fase Negra: actualizar pixeles donde (i+j) es impar ----
+        # Fase Negra: (i+j) impar
         for i in range(1, nrows - 1):
-            j_inicio = 1 + (i % 2)   # 1 si fila par, 2 si fila impar
+            j_inicio = 1 + (i % 2)
             for j in range(j_inicio, ncols - 1, 2):
                 if not mascara[i, j]:
-                    u_gs = (u[i-1, j] + u[i+1, j]
-                            + u[i, j-1] + u[i, j+1]
+                    u_gs = (u[i-1, j] + u[i+1, j] + u[i, j-1] + u[i, j+1]
                             + b[i, j]) * 0.25
                     u[i, j] += omega * (u_gs - u[i, j])
 
-        # ---- Residuo L2 (criterio de parada) ----
+        # Residuo r = b - A u
         res2 = 0.0
         for i in range(1, nrows - 1):
             for j in range(1, ncols - 1):
                 if not mascara[i, j]:
-                    r = (4.0 * u[i, j]
-                         - u[i-1, j] - u[i+1, j]
-                         - u[i, j-1] - u[i, j+1]
-                         - b[i, j])
+                    r = (b[i, j] - 4.0 * u[i, j]
+                         + u[i-1, j] + u[i+1, j] + u[i, j-1] + u[i, j+1])
                     res2 += r * r
         historial[k] = np.sqrt(res2)
 
         if historial[k] < tol:
             iteraciones = k + 1
-            convergio   = True
+            convergio = True
             break
 
     return u, iteraciones, convergio, historial[:iteraciones]
@@ -104,41 +95,21 @@ def _kernel_sor_rb(u, b, mascara, omega, max_iter, tol):
 @njit(cache=True, fastmath=True, parallel=True)
 def _kernel_sor_rb_screened(u, b, lam_map, omega, max_iter, tol):
     """
-    Kernel SOR Red-Black para la ecuacion de Poisson "screened" (apantallada):
+    SOR Red-Black paralelo para la ecuacion "screened":
 
-        (4 + lam_map[i,j]) * u[i,j] - sum(vecinos) = b[i,j]
+        (4 + lam_map[i,j]) * u[i,j] - (suma de vecinos) = b[i,j]
 
-    Esta es la ecuacion de Euler-Lagrange del funcional
-        E(u) = lam * sum_{(i,j) en muestras} (u-f)^2 + sum ||grad(u) - v'||^2
-    El termino `lam_map` ancla los pixeles muestreados (fidelidad de datos)
-    y `b` incluye -div(v') (campo de gradientes amplificado) mas lam*f en
-    los pixeles muestreados. Con lam_map=0 en todas partes se reduce al
-    kernel armonico/Poisson original (diagonal 4).
+    Los bordes (fila/columna 0 y ultima) no se actualizan: quedan con su
+    valor inicial como frontera de Dirichlet.
 
-    A diferencia de _kernel_sor_rb, NO recibe mascara: los bordes (fila/
-    columna 0 y -1) simplemente no se actualizan (quedan en su valor
-    inicial, usado como condicion de frontera tipo Dirichlet con la guia
-    bicubica). Las fases Roja y Negra se paralelizan con prange: dentro de
-    una fase, cada pixel solo lee vecinos del color opuesto, ya finalizados
-    en la fase anterior, por lo que no hay condiciones de carrera.
-
-    Parametros
-    ----------
-    u        : float64 (nrows, ncols), estimacion inicial / solucion in-place
-    b        : float64 (nrows, ncols), termino independiente
-    lam_map  : float64 (nrows, ncols), peso de fidelidad (lam en muestras, 0 si no)
-    omega    : float64, factor de sobrerrelajacion
-    max_iter : int, maximo de iteraciones
-    tol      : float64, tolerancia del residuo RELATIVO ||r||/||b||
-
-    Retorna
-    -------
-    u, iteraciones, convergio, historial (residuo relativo por iteracion)
+    tol es sobre el residuo RELATIVO ||r|| / ||b||, mas robusto que el
+    absoluto cuando la malla es grande.
+    Retorna (u, iteraciones, convergio, historial_residuo_relativo).
     """
     nrows, ncols = u.shape
-    historial    = np.empty(max_iter, dtype=np.float64)
-    iteraciones  = max_iter
-    convergio    = False
+    historial = np.empty(max_iter, dtype=np.float64)
+    iteraciones = max_iter
+    convergio = False
 
     norm_b = 0.0
     for i in range(nrows):
@@ -149,104 +120,79 @@ def _kernel_sor_rb_screened(u, b, lam_map, omega, max_iter, tol):
         norm_b = 1e-12
 
     for k in range(max_iter):
-
-        # ---- Fase Roja: (i+j) par ----
         for i in prange(1, nrows - 1):
             j_inicio = 2 - (i % 2)
             for j in range(j_inicio, ncols - 1, 2):
-                diag  = 4.0 + lam_map[i, j]
-                u_gs  = (u[i-1, j] + u[i+1, j]
-                         + u[i, j-1] + u[i, j+1]
-                         + b[i, j]) / diag
+                u_gs = (u[i-1, j] + u[i+1, j] + u[i, j-1] + u[i, j+1]
+                        + b[i, j]) / (4.0 + lam_map[i, j])
                 u[i, j] += omega * (u_gs - u[i, j])
 
-        # ---- Fase Negra: (i+j) impar ----
         for i in prange(1, nrows - 1):
             j_inicio = 1 + (i % 2)
             for j in range(j_inicio, ncols - 1, 2):
-                diag  = 4.0 + lam_map[i, j]
-                u_gs  = (u[i-1, j] + u[i+1, j]
-                         + u[i, j-1] + u[i, j+1]
-                         + b[i, j]) / diag
+                u_gs = (u[i-1, j] + u[i+1, j] + u[i, j-1] + u[i, j+1]
+                        + b[i, j]) / (4.0 + lam_map[i, j])
                 u[i, j] += omega * (u_gs - u[i, j])
 
-        # ---- Residuo relativo (criterio de parada) ----
         res2 = 0.0
         for i in prange(1, nrows - 1):
             for j in range(1, ncols - 1):
-                diag = 4.0 + lam_map[i, j]
-                r = (b[i, j]
-                     - diag * u[i, j]
-                     + u[i-1, j] + u[i+1, j]
-                     + u[i, j-1] + u[i, j+1])
+                r = (b[i, j] - (4.0 + lam_map[i, j]) * u[i, j]
+                     + u[i-1, j] + u[i+1, j] + u[i, j-1] + u[i, j+1])
                 res2 += r * r
         historial[k] = np.sqrt(res2) / norm_b
 
         if historial[k] < tol:
             iteraciones = k + 1
-            convergio   = True
+            convergio = True
             break
 
     return u, iteraciones, convergio, historial[:iteraciones]
 
 
 def _calentamiento():
-    """Fuerza la compilacion JIT de Numba con una malla de juguete."""
-    u  = np.zeros((8, 8),  dtype=np.float64)
-    b  = np.zeros((8, 8),  dtype=np.float64)
-    m  = np.zeros((8, 8),  dtype=np.bool_)
+    """Fuerza la compilacion JIT de los dos kernels con una malla pequena."""
+    u = np.zeros((8, 8), dtype=np.float64)
+    b = np.zeros((8, 8), dtype=np.float64)
+    m = np.zeros((8, 8), dtype=np.bool_)
     m[0, :] = m[-1, :] = m[:, 0] = m[:, -1] = True
-    _kernel_sor_rb(u, b, m, 1.5, 5, 1e-2)
-
     lam = np.zeros((8, 8), dtype=np.float64)
-    _kernel_sor_rb_screened(u.copy(), b, lam, 1.5, 5, 1e-2)
+    with _LOCK_KERNEL:
+        _kernel_sor_rb(u, b, m, 1.5, 3, 1e-2)
+        _kernel_sor_rb_screened(u.copy(), b, lam, 1.5, 3, 1e-2)
 
 
 def resolver(problema: dict, omega: float = None, tol: float = 1e-6,
              max_iter: int = 2000, ecuacion: str = 'poisson') -> dict:
     """
-    Resuelve la ecuacion de Poisson (o Laplace) usando SOR Red-Black.
+    Resuelve el problema clasico con mascara (core.poisson_builder.construir_problema).
 
-    Parametros
-    ----------
-    problema  : dict devuelto por poisson_builder.construir_problema()
-    omega     : factor de relajacion. None -> usa problema['omega_opt']
-    tol       : tolerancia de convergencia
-    max_iter  : maximo de iteraciones
-    ecuacion  : 'poisson' (b = divergencia) o 'laplace' (b = 0)
+    ecuacion : 'poisson' (usa b del problema) o 'laplace' (b = 0).
+    omega    : None usa problema['omega_opt'].
 
-    Retorna
-    -------
-    dict con:
-      'imagen_recon' : ndarray float64 [0,1], reconstruccion final
-      'iteraciones'  : int
-      'convergio'    : bool
-      'historial'    : ndarray float64, residuo por iteracion
-      'tiempo'       : float, segundos de computo
-      'omega'        : float, omega efectivamente usado
-      'ecuacion'     : str
+    Retorna dict con 'imagen_recon', 'iteraciones', 'convergio',
+    'historial', 'tiempo', 'omega', 'ecuacion'.
     """
     nrows, ncols = problema['forma']
-
-    b = (problema['b'].astype(np.float64)
-         if ecuacion == 'poisson'
-         else np.zeros((nrows, ncols), dtype=np.float64))
+    if ecuacion == 'poisson':
+        b = np.ascontiguousarray(problema['b'], dtype=np.float64)
+    else:
+        b = np.zeros((nrows, ncols), dtype=np.float64)
 
     if omega is None:
         omega = problema['omega_opt']
 
-    u       = np.ascontiguousarray(problema['imagen_baja'].copy(), dtype=np.float64)
-    b       = np.ascontiguousarray(b)
+    u = np.ascontiguousarray(problema['imagen_baja'], dtype=np.float64).copy()
     mascara = np.ascontiguousarray(problema['mascara'])
 
-    t0 = time.perf_counter()
-    u_sol, iters, convergio, historial = _kernel_sor_rb(
-        u, b, mascara, float(omega), int(max_iter), float(tol)
-    )
-    tiempo = time.perf_counter() - t0
+    with _LOCK_KERNEL:
+        t0 = time.perf_counter()
+        u, iters, convergio, historial = _kernel_sor_rb(
+            u, b, mascara, float(omega), int(max_iter), float(tol))
+        tiempo = time.perf_counter() - t0
 
     return {
-        'imagen_recon': np.clip(u_sol, 0.0, 1.0),
+        'imagen_recon': np.clip(u, 0.0, 1.0),
         'iteraciones':  int(iters),
         'convergio':    bool(convergio),
         'historial':    historial,
@@ -256,39 +202,27 @@ def resolver(problema: dict, omega: float = None, tol: float = 1e-6,
     }
 
 
-def resolver_screened(problema: dict, omega: float = None, tol: float = 1e-4,
-                       max_iter: int = 600) -> dict:
+def resolver_screened(problema: dict, omega: float = None, tol: float = 1e-6,
+                      max_iter: int = 150) -> dict:
     """
-    Resuelve el problema de Poisson "screened" (apantallado) construido por
-    poisson_builder.construir_problema_screened().
-
-    A diferencia de resolver(), no usa 'mascara' ni el argumento 'ecuacion':
-    el problema ya trae 'b' (incluye -div(v') + lam*f en las muestras) y
-    'lam_map' (peso de fidelidad por pixel). El criterio de parada es el
-    residuo RELATIVO ||r||/||b|| < tol (mas robusto que el residuo absoluto
-    para mallas grandes, donde el piso de precision de float64 hace que un
-    residuo absoluto muy pequeno nunca se alcance).
-
-    Retorna el mismo formato que resolver(), mas 'lam' (valor representativo
-    usado para omega_opt).
+    Resuelve un problema "screened" (core.poisson_builder.construir_problema_gradiente).
+    No recorta a [0,1]: el modelo RZI recorta al final del pipeline.
     """
-    nrows, ncols = problema['forma']
-
     if omega is None:
         omega = problema['omega_opt']
 
-    u       = np.ascontiguousarray(problema['imagen_baja'].copy(), dtype=np.float64)
-    b       = np.ascontiguousarray(problema['b'], dtype=np.float64)
+    u = np.ascontiguousarray(problema['imagen_baja'], dtype=np.float64).copy()
+    b = np.ascontiguousarray(problema['b'], dtype=np.float64)
     lam_map = np.ascontiguousarray(problema['lam_map'], dtype=np.float64)
 
-    t0 = time.perf_counter()
-    u_sol, iters, convergio, historial = _kernel_sor_rb_screened(
-        u, b, lam_map, float(omega), int(max_iter), float(tol)
-    )
-    tiempo = time.perf_counter() - t0
+    with _LOCK_KERNEL:
+        t0 = time.perf_counter()
+        u, iters, convergio, historial = _kernel_sor_rb_screened(
+            u, b, lam_map, float(omega), int(max_iter), float(tol))
+        tiempo = time.perf_counter() - t0
 
     return {
-        'imagen_recon': np.clip(u_sol, 0.0, 1.0),
+        'imagen_recon': u,
         'iteraciones':  int(iters),
         'convergio':    bool(convergio),
         'historial':    historial,
@@ -299,206 +233,90 @@ def resolver_screened(problema: dict, omega: float = None, tol: float = 1e-4,
     }
 
 
-def barrido_omega(problema: dict, tol: float = 5e-4, max_iter: int = 300,
-                  n_puntos: int = 38) -> dict:
+def barrido_omega(problema: dict, tol: float = 1e-3, max_iter: int = 500,
+                  n_puntos: int = 39) -> dict:
     """
-    Barre omega en [1.02, 1.99] y registra el numero de iteraciones.
-
-    Genera los datos para la Prueba de Convergencia Espectral (seccion 8.1):
-    la curva tiene forma de V con el minimo exactamente en omega_opt teorico.
-
-    Parametros
-    ----------
-    problema  : dict de construir_problema()
-    tol       : tolerancia relajada para acelerar el barrido
-    max_iter  : tope de iteraciones por punto del barrido
-    n_puntos  : cantidad de valores de omega evaluados
-
-    Retorna
-    -------
-    dict con 'omegas', 'iteraciones', 'omega_teorico'
+    Resuelve el mismo problema con muchos valores de omega en [1.0, 1.99] y
+    cuenta las iteraciones. La curva tiene forma de V y su minimo empirico
+    se compara con:
+      - omega estimado con la mascara (metodo de la potencia + Young), y
+      - omega de la formula de malla completa (solo como referencia; no
+        aplica cuando hay pixeles fijos en el interior).
     """
-    omegas     = np.linspace(1.02, 1.99, n_puntos)
+    omegas = np.linspace(1.0, 1.99, n_puntos)
     iteraciones = []
-
     for om in omegas:
-        res = resolver(problema, omega=float(om), tol=tol,
-                       max_iter=max_iter, ecuacion='poisson')
+        res = resolver(problema, omega=float(om), tol=tol, max_iter=max_iter,
+                       ecuacion='poisson')
         iteraciones.append(res['iteraciones'])
 
+    idx = int(np.argmin(iteraciones))
     return {
-        'omegas':       omegas.tolist(),
-        'iteraciones':  iteraciones,
-        'omega_teorico': problema['omega_opt'],
+        'omegas':               omegas.tolist(),
+        'iteraciones':          iteraciones,
+        'omega_teorico':        problema['omega_opt'],
+        'omega_malla_completa': problema.get('omega_malla_completa'),
+        'omega_empirico':       float(omegas[idx]),
+        'max_iter':             max_iter,
     }
 
 
-def benchmark_numba_vs_python(problema: dict, tol: float = 1e-4,
-                               max_iter: int = 200) -> dict:
+def _sor_python_puro(u, b, mascara, omega, n_iter):
+    """Misma logica que _kernel_sor_rb, en Python puro (sin Numba)."""
+    nrows, ncols = u.shape
+    historial = []
+    for _ in range(n_iter):
+        for i in range(1, nrows - 1):
+            for j in range(2 - (i % 2), ncols - 1, 2):
+                if not mascara[i, j]:
+                    u_gs = (u[i-1, j] + u[i+1, j] + u[i, j-1] + u[i, j+1] + b[i, j]) * 0.25
+                    u[i, j] += omega * (u_gs - u[i, j])
+        for i in range(1, nrows - 1):
+            for j in range(1 + (i % 2), ncols - 1, 2):
+                if not mascara[i, j]:
+                    u_gs = (u[i-1, j] + u[i+1, j] + u[i, j-1] + u[i, j+1] + b[i, j]) * 0.25
+                    u[i, j] += omega * (u_gs - u[i, j])
+        res2 = 0.0
+        for i in range(1, nrows - 1):
+            for j in range(1, ncols - 1):
+                if not mascara[i, j]:
+                    r = (b[i, j] - 4.0 * u[i, j]
+                         + u[i-1, j] + u[i+1, j] + u[i, j-1] + u[i, j+1])
+                    res2 += r * r
+        historial.append(res2 ** 0.5)
+    return u, historial
+
+
+def benchmark_numba_vs_python(problema: dict, n_iter: int = 30) -> dict:
     """
-    Compara el tiempo de ejecucion entre Numba y Python puro.
-    Necesario para la Prueba de Rendimiento (seccion 8.3).
+    Compara Numba contra Python puro haciendo EXACTAMENTE el mismo trabajo:
+    n_iter iteraciones completas (fase roja, fase negra y residuo), sin
+    criterio de parada. Solo se mide el bucle de calculo.
     """
     omega = problema['omega_opt']
-
-    # --- Numba ---
-    t0  = time.perf_counter()
-    res = resolver(problema, omega=omega, tol=tol, max_iter=max_iter)
-    t_numba = time.perf_counter() - t0
-    iters = res['iteraciones']
-
-    # --- Python puro (misma logica, sin @njit) ---
-    nrows, ncols = problema['forma']
-    u       = problema['imagen_baja'].copy().astype(np.float64)
-    b       = problema['b'].astype(np.float64)
-    mascara = problema['mascara']
-
-    t1 = time.perf_counter()
-    for k in range(max(1, iters)):     # mismas iteraciones que Numba
-        for i in range(1, nrows - 1):
-            j_ini = 2 - (i % 2)
-            for j in range(j_ini, ncols - 1, 2):
-                if not mascara[i, j]:
-                    u_gs = (u[i-1,j]+u[i+1,j]+u[i,j-1]+u[i,j+1]+b[i,j])*0.25
-                    u[i, j] += omega * (u_gs - u[i, j])
-        for i in range(1, nrows - 1):
-            j_ini = 1 + (i % 2)
-            for j in range(j_ini, ncols - 1, 2):
-                if not mascara[i, j]:
-                    u_gs = (u[i-1,j]+u[i+1,j]+u[i,j-1]+u[i,j+1]+b[i,j])*0.25
-                    u[i, j] += omega * (u_gs - u[i, j])
-    t_python = time.perf_counter() - t1
-
-    aceleracion = t_python / t_numba if t_numba > 0 else float('inf')
-
-    return {
-        'tiempo_numba':   t_numba,
-        'tiempo_python':  t_python,
-        'aceleracion':    aceleracion,
-        'iteraciones':    iters,
-        'forma':          problema['forma'],
-        'numba_activo':   NUMBA_DISPONIBLE,
-    }
-
-
-def resolver_con_snapshots(problema: dict, omega: float = None, tol: float = 1e-6,
-                           max_iter: int = 2000, ecuacion: str = 'poisson',
-                           cada_n_iter: int = 20) -> dict:
-    """
-    Resuelve la ecuacion capturando snapshots del estado de la malla
-    cada N iteraciones. Util para animaciones de convergencia.
-
-    Retorna un dict con los mismos campos que resolver() mas:
-    'snapshots': lista de ndarrays float64 [0,1] con el estado cada N iteraciones.
-    """
-    import numpy as np
-    import time
-
-    nrows, ncols = problema['forma']
-    b = (problema['b'].astype(np.float64)
-         if ecuacion == 'poisson'
-         else np.zeros((nrows, ncols), dtype=np.float64))
-
-    if omega is None:
-        omega = problema['omega_opt']
-
-    u       = np.ascontiguousarray(problema['imagen_baja'].copy(), dtype=np.float64)
-    b       = np.ascontiguousarray(b)
+    u0 = np.ascontiguousarray(problema['imagen_baja'], dtype=np.float64)
+    b = np.ascontiguousarray(problema['b'], dtype=np.float64)
     mascara = np.ascontiguousarray(problema['mascara'])
 
-    snapshots = []
-    t0 = time.perf_counter()
+    _calentamiento()  # que la compilacion JIT no cuente en el tiempo
 
-    snapshots.append(np.clip(u.copy(), 0.0, 1.0))
+    u_nb = u0.copy()
+    with _LOCK_KERNEL:
+        t0 = time.perf_counter()
+        u_nb, _, _, _ = _kernel_sor_rb(u_nb, b, mascara, float(omega), int(n_iter), -1.0)
+        t_numba = time.perf_counter() - t0
 
-    iteraciones_totales = 0
-    convergio = False
-    historial_acumulado = []
-
-    for bloque in range(0, max_iter, cada_n_iter):
-        iters_bloque = min(cada_n_iter, max_iter - bloque)
-        u_sol, iters, conv, hist = _kernel_sor_rb(
-            u, b, mascara, float(omega), int(iters_bloque), float(tol)
-        )
-        iteraciones_totales += iters
-        historial_acumulado.extend(hist.tolist())
-
-        snapshots.append(np.clip(u_sol.copy(), 0.0, 1.0))
-
-        if conv:
-            convergio = True
-            break
-
-    tiempo = time.perf_counter() - t0
+    u_py = u0.copy()
+    t1 = time.perf_counter()
+    u_py, _ = _sor_python_puro(u_py, b, mascara, float(omega), int(n_iter))
+    t_python = time.perf_counter() - t1
 
     return {
-        'imagen_recon': np.clip(u, 0.0, 1.0),
-        'snapshots': snapshots,
-        'iteraciones': iteraciones_totales,
-        'convergio': convergio,
-        'historial': np.array(historial_acumulado),
-        'tiempo': tiempo,
-        'omega': float(omega),
-        'ecuacion': ecuacion,
-        'cada_n_iter': cada_n_iter,
-    }
-
-
-def resolver_screened_con_snapshots(problema: dict, omega: float = None, tol: float = 1e-4,
-                                     max_iter: int = 600, cada_n_iter: int = 8) -> dict:
-    """
-    Version de resolver_screened() que captura snapshots del estado de la
-    malla cada 'cada_n_iter' iteraciones (incluye el estado inicial, la guia
-    bicubica). Util para animar la convergencia del modelo screened.
-
-    Retorna el mismo formato que resolver_screened(), mas:
-    'snapshots'    : lista de ndarrays float64 [0,1] (cada uno en la grilla
-                     de esta etapa).
-    'cada_n_iter'  : int.
-    """
-    nrows, ncols = problema['forma']
-
-    if omega is None:
-        omega = problema['omega_opt']
-
-    u       = np.ascontiguousarray(problema['imagen_baja'].copy(), dtype=np.float64)
-    b       = np.ascontiguousarray(problema['b'], dtype=np.float64)
-    lam_map = np.ascontiguousarray(problema['lam_map'], dtype=np.float64)
-
-    snapshots = []
-    t0 = time.perf_counter()
-
-    snapshots.append(np.clip(u.copy(), 0.0, 1.0))
-
-    iteraciones_totales = 0
-    convergio = False
-    historial_acumulado = []
-
-    for bloque in range(0, max_iter, cada_n_iter):
-        iters_bloque = min(cada_n_iter, max_iter - bloque)
-        u, iters, conv, hist = _kernel_sor_rb_screened(
-            u, b, lam_map, float(omega), int(iters_bloque), float(tol)
-        )
-        iteraciones_totales += iters
-        historial_acumulado.extend(hist.tolist())
-
-        snapshots.append(np.clip(u.copy(), 0.0, 1.0))
-
-        if conv:
-            convergio = True
-            break
-
-    tiempo = time.perf_counter() - t0
-
-    return {
-        'imagen_recon': np.clip(u, 0.0, 1.0),
-        'snapshots': snapshots,
-        'iteraciones': iteraciones_totales,
-        'convergio': convergio,
-        'historial': np.array(historial_acumulado),
-        'tiempo': tiempo,
-        'omega': float(omega),
-        'ecuacion': 'screened',
-        'lam': problema.get('lam', 0.0),
-        'cada_n_iter': cada_n_iter,
+        'tiempo_numba':  t_numba,
+        'tiempo_python': t_python,
+        'aceleracion':   t_python / t_numba if t_numba > 0 else float('inf'),
+        'iteraciones':   int(n_iter),
+        'forma':         problema['forma'],
+        'numba_activo':  NUMBA_DISPONIBLE,
+        'diferencia_max': float(np.max(np.abs(u_nb - u_py))),
     }

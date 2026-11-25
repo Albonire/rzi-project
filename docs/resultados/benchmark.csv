@@ -1,0 +1,4 @@
+malla,iteraciones,tiempo_python_s,tiempo_numba_s,aceleracion
+64x64,20,0.1081,0.000200,541
+128x128,20,0.5055,0.000940,538
+256x256,20,1.6647,0.004211,395

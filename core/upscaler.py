@@ -1,346 +1,241 @@
 """
-Capa 2 (extension) - Pipeline de upscaling con Poisson "screened".
+Capa 2 - Modelo RZI de ampliacion (upscaling) de imagenes.
 
-Implementa la seccion C del documento "Analisis Critico y Mejora del
-Proyecto RZI": cascada multiescala (coarse-to-fine), back-projection y
-anti-ringing, ademas de una variante para imagenes a color (YCbCr).
+Idea en una frase: buscamos una imagen grande u que (1) al reducirla vuelva
+a dar la imagen pequena original y (2) tenga bordes firmes. Lo logramos
+alternando dos pasos:
 
-Usa PIL (modo 'F' para resize de arreglos float) y scipy.ndimage; no agrega
-cv2 como dependencia nueva del proyecto.
+  a) Back-projection (consistencia con los datos):
+         t = u + Up( f - Down(u) )
+     Down = reduccion bicubica con antialias (modelo de como se "achica"
+     una imagen), Up = ampliacion bicubica. Si Down(u) ya coincide con f,
+     la correccion es cero.
+
+  b) Poisson "screened" con gradientes amplificados (regularizacion), que
+     se resuelve con SOR Red-Black + Numba:
+         (4 + lam) u - (suma de vecinos) = -div(v) + lam * t
+     v es el campo de gradientes de t, reforzado en los bordes reales
+     (ver core.poisson_builder.amplified_guidance). La ecuacion limpia el
+     "ringing" que deja la back-projection y mantiene los bordes nitidos.
+
+Se repite 'ciclos' veces y se termina con unas pasadas de back-projection.
+
+La malla esta centrada en pixeles: la salida mide exactamente
+(h*factor, w*factor), sin estirar ni recortar nada.
+
+Imagenes a color: se procesa la luminancia Y (donde el ojo percibe la
+nitidez) con el modelo completo, y la crominancia (Cb, Cr) con bicubica mas
+back-projection.
 """
 
 import numpy as np
 from PIL import Image
 from scipy.ndimage import minimum_filter, maximum_filter
 
-from core.image_ops import resize_float, unsharp_mask_float, ycbcr_a_rgb
-from core.edge_enhance import shock_filter, anisotropic_diffusion
-from core.poisson_builder import construir_problema_screened
-from core.sor_solver import resolver_screened, resolver_screened_con_snapshots
+from core.image_ops import (resize_float, unsharp_mask_float,
+                            rgb_a_ycbcr, ycbcr_a_rgb)
+from core.poisson_builder import construir_problema_gradiente
+from core.sor_solver import resolver_screened
+
+# Tope de tamano de salida (pixeles) para no saturar memoria ni tiempo.
+MAX_PIXELES_SALIDA = 4_000_000
+
+# Valores por defecto ajustados con scripts/generar_resultados.py
+# (4 imagenes de prueba, factores x2, x3 y x4).
+PARAMS_DEFECTO = dict(lam=0.3, beta=1.6, tau=0.05, sigma=0.6, ciclos=10,
+                      bp_final=5, sor_iters=150, tol=1e-6)
 
 
-def _descomponer_factor(factor: int) -> list:
+def reducir(u: np.ndarray, w: int, h: int) -> np.ndarray:
+    """Operador Down: reduccion bicubica con antialias (PIL escala el nucleo)."""
+    return resize_float(u, w, h, Image.BICUBIC)
+
+
+def ampliar(u: np.ndarray, w: int, h: int) -> np.ndarray:
+    """Operador Up: ampliacion bicubica."""
+    return resize_float(u, w, h, Image.BICUBIC)
+
+
+def back_projection(u: np.ndarray, f_lr: np.ndarray, n_pass: int = 1,
+                    gain: float = 1.0) -> np.ndarray:
     """
-    Descompone 'factor' en una secuencia de etapas para la cascada
-    coarse-to-fine.
-
-    Para factores potencia de 2 (2, 4, 8, ...) produce una cascada completa
-    de etapas x2. Para factor=6 produce [2, 3] (una etapa x2 seguida de una
-    x3). Para factores sin divisores pares utiles (3, 5, 7, ...) o factor=1
-    devuelve una unica etapa [factor] (resolucion directa, sin cascada).
-    """
-    if factor <= 1:
-        return [max(1, factor)]
-
-    etapas = []
-    f = factor
-    while f % 2 == 0 and f > 2:
-        etapas.append(2)
-        f //= 2
-    etapas.append(f)
-    return etapas
-
-
-# alias retro-compatible: la implementacion vive en core/image_ops (modulo
-# compartido sin dependencias circulares con poisson_builder).
-_resize_float = resize_float
-
-
-def back_projection(u: np.ndarray, f_lr: np.ndarray, n_pass: int = 3,
-                     gain: float = 0.8) -> np.ndarray:
-    """
-    Refuerza la consistencia Down(u) ~= f_lr (seccion C del documento).
-
-    En cada pasada:
-      1. Down(u): se reduce 'u' al tamano de 'f_lr' con Image.BOX (promedio
-         de area, evita aliasing).
-      2. residuo = f_lr - Down(u).
-      3. Up(residuo): se agranda el residuo de vuelta al tamano de 'u' con
-         Image.BICUBIC.
-      4. u <- u + gain * Up(residuo).
-
-    Cada pasada minimiza el residuo ||Down(u) - f_lr||, recuperando alta
-    frecuencia de forma principiada ("back-projection iterativa reforzada").
-    n_pass=3 (por defecto) converge mejor que 2 sin llegar a oscilar;
-    gain<1 amortigua cualquier sobre-correccion entre pasadas.
+    Back-projection iterativa (Irani y Peleg, 1991):
+        u <- u + gain * Up( f_lr - Down(u) )
+    Cada pasada reduce el error de consistencia ||Down(u) - f_lr||.
     """
     h_lr, w_lr = f_lr.shape
     h_hi, w_hi = u.shape
-
-    out = u.copy()
+    out = u
     for _ in range(n_pass):
-        bajada  = _resize_float(out, w_lr, h_lr, Image.BOX)
-        residuo = f_lr - bajada
-        subida  = _resize_float(residuo, w_hi, h_hi, Image.BICUBIC)
-        out = out + gain * subida
-
+        residuo = f_lr - reducir(out, w_lr, h_lr)
+        out = out + gain * ampliar(residuo, w_hi, h_hi)
     return out
 
 
+def error_consistencia(u: np.ndarray, f_lr: np.ndarray) -> float:
+    """Error RMS entre Down(u) y la imagen pequena original."""
+    h, w = f_lr.shape
+    return float(np.sqrt(np.mean((reducir(u, w, h) - f_lr) ** 2)))
+
+
 def anti_ringing(u: np.ndarray, ref: np.ndarray) -> np.ndarray:
+    """Recorta u al rango [min, max] local 3x3 de una referencia."""
+    return np.clip(u, minimum_filter(ref, size=3), maximum_filter(ref, size=3))
+
+
+def realce_perceptual(u: np.ndarray, f_lr: np.ndarray, fuerza: float) -> np.ndarray:
     """
-    Recorta 'u' al rango [min, max] local 3x3 de una referencia bicubica
-    'ref', evitando el sobre-realce ("ringing") cerca de bordes fuertes
-    (seccion C del documento).
+    Realce opcional de nitidez visual (por defecto apagado).
+
+    Unsharp mask controlado: se suma 1.5*fuerza veces el detalle fino
+    (u - Gauss(u)), se recorta al rango local 3x3 de u (evita halos) y se
+    reproyecta 2 veces para no perder la consistencia con los datos.
+    Hace los bordes mas marcados a la vista, a cambio de bajar un poco el
+    PSNR (es un realce "para el ojo", no una mejora de fidelidad).
     """
-    lo = minimum_filter(ref, size=3)
-    hi = maximum_filter(ref, size=3)
-    return np.clip(u, lo, hi)
+    if fuerza <= 0:
+        return u
+    v = unsharp_mask_float(u, percent=150.0 * fuerza, radius=1.2)
+    v = anti_ringing(v, u)
+    return np.clip(back_projection(v, f_lr, n_pass=2), 0.0, 1.0)
 
 
-def finalizar_display(u: np.ndarray, tile: np.ndarray, factor: int,
-                       usm_pct: float, radius: float = 1.5,
-                       threshold: float = 0.0,
-                       usar_difusion: bool = True, difusion_iters: int = 5,
-                       difusion_kappa: float = 0.03,
-                       usar_shock: bool = True, shock_iters: int = 3) -> np.ndarray:
+def _ajustar_tamano(tile: np.ndarray, factor: int) -> tuple:
+    """Si la salida superaria MAX_PIXELES_SALIDA, reduce el tile de entrada."""
+    h, w = tile.shape[:2]
+    if h * w * factor * factor <= MAX_PIXELES_SALIDA:
+        return tile, False
+    escala = np.sqrt(MAX_PIXELES_SALIDA / (h * w * factor * factor))
+    nw, nh = max(8, int(w * escala)), max(8, int(h * escala))
+    if tile.ndim == 2:
+        return np.clip(resize_float(tile, nw, nh, Image.LANCZOS), 0, 1), True
+    canales = [resize_float(tile[..., c], nw, nh, Image.LANCZOS) for c in range(3)]
+    return np.clip(np.stack(canales, axis=-1), 0, 1), True
+
+
+def upscale_rzi(tile: np.ndarray, factor: int = 4, lam: float = 0.3,
+                beta: float = 1.6, tau: float = 0.05, sigma: float = 0.6,
+                ciclos: int = 10, bp_final: int = 5, sor_iters: int = 150,
+                tol: float = 1e-6, omega: float = None, realce: float = 0.0,
+                usar_anti_ringing: bool = False,
+                capturar_snapshots: bool = False) -> dict:
     """
-    Acabado de display compartido: lleva 'u' (salida de un solver, en
-    cualquier grilla intermedia) al tamano de display tw*factor x th*factor
-    con LANCZOS y aplica, en orden, el "stack de nitidez" puramente
-    matematico (seccion 5.3 de steps.md):
+    Amplia una imagen en escala de grises 'factor' veces con el modelo RZI.
 
-      1. resize LANCZOS al tamano de display.
-      2. anisotropic_diffusion (Perona-Malik), si usar_difusion: limpia
-         ruido de grano en zonas planas preservando bordes. Va PRIMERO para
-         no amplificar ese ruido en el paso siguiente.
-      3. shock_filter (Osher-Rudin), si usar_shock: convierte rampas
-         borrosas en transiciones nitidas (afila bordes).
-      4. USM (si usm_pct>0): realce adicional opcional, tipicamente bajo
-         porque el shock filter ya aporta la mayor parte de la nitidez.
-      5. anti_ringing contra una guia bicubica del mismo tamano: acota
-         cualquier overshoot introducido por shock/USM (evita halos).
+    Parametros principales
+    ----------------------
+    tile      : ndarray float64 [0,1], forma (h, w).
+    factor    : factor de ampliacion entero (2..8).
+    lam       : peso de fidelidad del Poisson screened.
+    beta, tau : amplificacion de bordes (beta=1 desactiva la amplificacion).
+    ciclos    : cuantas veces se alterna back-projection + SOR.
+    bp_final  : pasadas finales de back-projection.
+    omega     : None usa el omega optimo de la malla; un valor lo fuerza.
+    realce    : 0..1, realce perceptual opcional (ver realce_perceptual).
 
-    Todo el calculo se hace en float64 [0,1] (resize_float + unsharp_mask_float
-    + edge_enhance de core/, sin viaje intermedio por uint8/256 niveles, lo
-    que evita banding al amplificar degradados suaves).
-
-    Es la funcion que usan tanto "Reconstruir" (_upscale_display) como cada
-    frame de "Animar convergencia": cualquier mejora aqui se refleja en
-    ambos flujos.
-    """
-    th, tw = tile.shape
-    out_h, out_w = th * factor, tw * factor
-
-    u = np.clip(u, 0.0, 1.0)
-    if u.shape != (out_h, out_w):
-        display = resize_float(u, out_w, out_h, Image.LANCZOS)
-    else:
-        display = u.copy()
-
-    if usar_difusion and difusion_iters > 0:
-        display = anisotropic_diffusion(display, iteraciones=difusion_iters,
-                                          kappa=difusion_kappa)
-
-    if usar_shock and shock_iters > 0:
-        display = shock_filter(display, iteraciones=shock_iters)
-
-    if usm_pct > 0:
-        display = unsharp_mask_float(display, percent=usm_pct, radius=radius,
-                                       threshold=threshold)
-
-    bic = resize_float(tile, out_w, out_h, Image.BICUBIC)
-    bic = np.clip(bic, 0.0, 1.0)
-
-    return anti_ringing(display, bic)
-
-
-def finalizar_display_color(y_recon: np.ndarray, cb: np.ndarray, cr: np.ndarray,
-                             y_tile: np.ndarray, factor: int, usm_pct: float,
-                             radius: float = 1.5, threshold: float = 0.0,
-                             usar_difusion: bool = True, difusion_iters: int = 5,
-                             difusion_kappa: float = 0.03,
-                             usar_shock: bool = True, shock_iters: int = 3) -> np.ndarray:
-    """
-    Acabado de display para imagenes a color (enfoque luminancia-PDE,
-    seccion 5.3 de steps.md).
-
-    El canal de luminancia ('y_recon', salida del solver Poisson-screened)
-    pasa por TODO el stack de `finalizar_display` (difusion, shock, USM,
-    anti-ringing): la nitidez y la limpieza de ruido se calculan sobre
-    luminancia, donde el ojo es mas sensible. Los canales de crominancia
-    (cb, cr) solo se reescalan a bicubica al tamano final, sin realce (esto
-    evita franjas/artefactos de color que aparecerian si shock/difusion se
-    aplicaran por canal RGB de forma independiente).
-
-    Devuelve una imagen RGB float64 [0,1] de forma (th*factor, tw*factor, 3).
-    """
-    y_disp = finalizar_display(y_recon, y_tile, factor, usm_pct,
-                                radius=radius, threshold=threshold,
-                                usar_difusion=usar_difusion,
-                                difusion_iters=difusion_iters,
-                                difusion_kappa=difusion_kappa,
-                                usar_shock=usar_shock,
-                                shock_iters=shock_iters)
-
-    out_h, out_w = y_disp.shape
-    cb_disp = resize_float(cb, out_w, out_h, Image.BICUBIC)
-    cr_disp = resize_float(cr, out_w, out_h, Image.BICUBIC)
-    cb_disp = np.clip(cb_disp, 0.0, 1.0)
-    cr_disp = np.clip(cr_disp, 0.0, 1.0)
-
-    return ycbcr_a_rgb(y_disp, cb_disp, cr_disp)
-
-
-def upscale_poisson_screened(tile: np.ndarray, factor: int = 4,
-                              lam: float = 8.0, beta: float = 1.7,
-                              tau: float = 0.02,
-                              usar_back_projection: bool = True,
-                              usar_anti_ringing: bool = True,
-                              usar_multiescala: bool = True,
-                              n_back_pass: int = 3, back_gain: float = 0.8,
-                              tol: float = 1e-4, max_iter: int = 600,
-                              capturar_snapshots: bool = False,
-                              snapshots_cada: int = 8,
-                              max_snapshots: int = 48) -> dict:
-    """
-    Pipeline completo de upscaling con Poisson "screened" + amplificacion
-    adaptativa de gradientes (seccion B y C del documento).
-
-    Si usar_multiescala=True y 'factor' admite descomposicion en etapas mas
-    pequenas (ver _descomponer_factor), se resuelve en cascada
-    coarse-to-fine: el resultado de cada etapa sirve de entrada (warm start)
-    a la siguiente. Esto mejora la calidad y reduce el numero total de
-    iteraciones de SOR respecto de resolver directamente al factor final.
-
-    Tras la cascada se aplican (si estan activados):
-      - back_projection: fuerza Down(u) ~= tile original.
-      - anti_ringing: recorta a los limites locales de la guia bicubica
-        final, evitando sobre-realces.
-
-    Si capturar_snapshots=True, se usa resolver_screened_con_snapshots en cada
-    etapa de la cascada y se acumulan los estados intermedios de 'u' (cada
-    etapa en su propia grilla) en 'snapshots', agregando 'imagen_recon' final
-    (tras back-projection y anti-ringing) como ultimo elemento. Si la lista
-    resultante supera 'max_snapshots', se submuestrea uniformemente
-    conservando el primero y el ultimo. Sin capturar_snapshots, el resultado
-    es identico al de antes ('snapshots' es None).
-
-    Retorna un dict:
-        'imagen_recon' : ndarray float64 [0,1], imagen agrandada.
-        'iteraciones'  : suma de iteraciones SOR de todas las etapas.
-        'tiempo'       : tiempo total de SOR (sin contar resize/filtros).
-        'omega'        : omega usado en la ultima etapa.
-        'convergio'    : True si todas las etapas convergieron.
-        'etapas'       : lista de factores de cada etapa de la cascada.
-        'lam'          : lambda usado.
-        'snapshots'    : lista de estados intermedios de 'u' (o None).
+    Retorna dict con:
+        'imagen_recon'    : ndarray (h*factor, w*factor) en [0,1].
+        'iteraciones'     : total de iteraciones SOR.
+        'tiempo'          : segundos dentro del solver SOR.
+        'omega'           : omega usado.
+        'convergio'       : True si todos los SOR alcanzaron la tolerancia.
+        'historial'       : residuo relativo de todas las iteraciones SOR.
+        'error_datos'     : error RMS ||Down(u) - f|| tras cada ciclo.
+        'snapshots'       : estados intermedios (o None).
+        'tile_reducido'   : True si se redujo la entrada por el tope de memoria.
     """
     if tile.ndim != 2:
-        raise ValueError("Se espera tile 2D en escala de grises.")
+        raise ValueError("upscale_rzi espera un canal 2D; use upscale() para color.")
+    factor = int(factor)
+    if factor < 1:
+        raise ValueError("El factor debe ser >= 1.")
 
-    f_lr = tile.astype(np.float64)
+    f_lr, reducido = _ajustar_tamano(np.asarray(tile, dtype=np.float64), factor)
+    h, w = f_lr.shape
+    H, W = h * factor, w * factor
 
-    if usar_multiescala:
-        etapas = _descomponer_factor(factor)
-    else:
-        etapas = [factor]
+    u = np.clip(ampliar(f_lr, W, H), 0.0, 1.0)
+    snapshots = [u.copy()] if capturar_snapshots else None
+    error_datos = [error_consistencia(u, f_lr)]
+    historial = []
+    iteraciones = 0
+    tiempo = 0.0
+    convergio = True
+    omega_usado = omega
 
-    u = f_lr
-    iters_total = 0
-    tiempo_total = 0.0
-    omega_usado = None
-    historial_final = np.array([])
-    convergio_total = True
-    snapshots_raw = [] if capturar_snapshots else None
+    if factor > 1:
+        for _ in range(int(ciclos)):
+            t = back_projection(u, f_lr, n_pass=1)
+            problema = construir_problema_gradiente(t, lam=lam, beta=beta,
+                                                    tau=tau, sigma=sigma)
+            res = resolver_screened(problema, omega=omega, tol=tol,
+                                    max_iter=sor_iters)
+            u = res['imagen_recon']
+            iteraciones += res['iteraciones']
+            tiempo += res['tiempo']
+            convergio = convergio and res['convergio']
+            omega_usado = res['omega']
+            historial.extend(res['historial'].tolist())
+            error_datos.append(error_consistencia(u, f_lr))
+            if capturar_snapshots:
+                snapshots.append(np.clip(u, 0.0, 1.0))
 
-    for etapa_factor in etapas:
-        if etapa_factor <= 1:
-            continue
-        problema = construir_problema_screened(u, etapa_factor, lam=lam,
-                                                 beta=beta, tau=tau)
-        if capturar_snapshots:
-            resultado = resolver_screened_con_snapshots(
-                problema, tol=tol, max_iter=max_iter, cada_n_iter=snapshots_cada)
-            snapshots_raw.extend(resultado['snapshots'])
-        else:
-            resultado = resolver_screened(problema, tol=tol, max_iter=max_iter)
-        u = resultado['imagen_recon']
-        iters_total += resultado['iteraciones']
-        tiempo_total += resultado['tiempo']
-        omega_usado = resultado['omega']
-        historial_final = resultado['historial']
-        convergio_total = convergio_total and resultado['convergio']
+        u = back_projection(u, f_lr, n_pass=int(bp_final))
 
-    if usar_back_projection:
-        u = back_projection(u, f_lr, n_pass=n_back_pass, gain=back_gain)
+        if usar_anti_ringing:
+            u = anti_ringing(u, np.clip(ampliar(f_lr, W, H), 0.0, 1.0))
+        u = np.clip(u, 0.0, 1.0)
+        u = realce_perceptual(u, f_lr, realce)
+        error_datos.append(error_consistencia(u, f_lr))
 
-    if usar_anti_ringing:
-        # La malla real de u puede ser menor que la nominal (h-1)*factor+1 si el
-        # tope de memoria de construir_problema_screened redujo el tile durante la
-        # cascada. Construimos la guia al tamaño REAL de u para que las formas
-        # coincidan (evita el crash de broadcast en regiones grandes).
-        new_h, new_w = u.shape
-        ref = _resize_float(f_lr, new_w, new_h, Image.BICUBIC)
-        u = anti_ringing(u, ref)
-
-    snapshots = None
+    u = np.clip(u, 0.0, 1.0)
     if capturar_snapshots:
-        snapshots_raw.append(np.clip(u, 0.0, 1.0))
-        if len(snapshots_raw) > max_snapshots:
-            idx = np.linspace(0, len(snapshots_raw) - 1, max_snapshots).round().astype(int)
-            idx = sorted(set(idx.tolist()))
-            snapshots_raw = [snapshots_raw[i] for i in idx]
-        snapshots = snapshots_raw
+        snapshots.append(u.copy())
 
     return {
-        'imagen_recon': np.clip(u, 0.0, 1.0),
-        'iteraciones':  iters_total,
-        'tiempo':       tiempo_total,
-        'omega':        omega_usado,
-        'convergio':    convergio_total,
-        'historial':    historial_final,
-        'etapas':       etapas,
-        'lam':          lam,
-        'snapshots':    snapshots,
+        'imagen_recon':  u,
+        'iteraciones':   int(iteraciones),
+        'tiempo':        float(tiempo),
+        'omega':         float(omega_usado) if omega_usado is not None else float('nan'),
+        'convergio':     bool(convergio),
+        'historial':     np.asarray(historial, dtype=np.float64),
+        'error_datos':   np.asarray(error_datos, dtype=np.float64),
+        'snapshots':     snapshots,
+        'tile_reducido': reducido,
+        'factor':        factor,
+        'lam':           float(lam),
     }
 
 
-def upscale_color(rgb_arr: np.ndarray, factor: int = 4, lam: float = 8.0,
-                   beta: float = 1.7, tau: float = 0.02,
-                   **kwargs) -> np.ndarray:
+def _upscale_croma(c: np.ndarray, factor: int, n_bp: int = 3) -> np.ndarray:
+    """Crominancia: bicubica + back-projection (barato, sin regularizacion)."""
+    h, w = c.shape
+    up = ampliar(c, w * factor, h * factor)
+    return np.clip(back_projection(up, c, n_pass=n_bp), 0.0, 1.0)
+
+
+def upscale(tile: np.ndarray, factor: int = 4, **kwargs) -> dict:
     """
-    Upscaling de imagenes a color (seccion C del documento): el modelo
-    Poisson "screened" se resuelve solo sobre el canal de luminancia (Y de
-    YCbCr), mientras que los canales de crominancia (Cb, Cr) se agrandan con
-    interpolacion bicubica (el ojo es mucho menos sensible a la nitidez del
-    color que a la de la luminancia).
+    Punto de entrada general: acepta imagen en grises (h, w) o RGB (h, w, 3).
 
-    Esta funcion es una capacidad de la libreria que NO esta conectada a la
-    interfaz grafica (que trabaja solo en escala de grises); se documenta
-    aqui para uso programatico o futuras extensiones de la UI.
-
-    Parametros
-    ----------
-    rgb_arr : ndarray float64 [0,1] o uint8, shape (h, w, 3).
-    factor, lam, beta, tau, **kwargs : ver upscale_poisson_screened.
-
-    Retorna
-    -------
-    ndarray float64 [0,1], shape (new_h, new_w, 3).
+    En color, la luminancia Y pasa por upscale_rzi y Cb/Cr por bicubica con
+    back-projection; luego se recombinan en RGB. El dict devuelto es el de
+    upscale_rzi, con 'imagen_recon' (y 'snapshots') en RGB si la entrada lo era.
     """
-    if rgb_arr.ndim != 3 or rgb_arr.shape[2] < 3:
-        raise ValueError("Se espera imagen RGB de 3 canales.")
+    tile = np.asarray(tile, dtype=np.float64)
+    if tile.ndim == 2:
+        return upscale_rzi(tile, factor, **kwargs)
+    if tile.ndim != 3 or tile.shape[2] < 3:
+        raise ValueError("Se espera imagen 2D o RGB (h, w, 3).")
 
-    img = np.asarray(rgb_arr, dtype=np.float64)
-    if img.max() > 1.01:
-        img = img / 255.0
+    tile, reducido = _ajustar_tamano(tile[..., :3], factor)
+    y, cb, cr = rgb_a_ycbcr(tile)
+    res = upscale_rzi(y, factor, **kwargs)
+    res['tile_reducido'] = reducido
+    cb_up = _upscale_croma(cb, factor)
+    cr_up = _upscale_croma(cr, factor)
 
-    pil_rgb = Image.fromarray((np.clip(img, 0.0, 1.0) * 255).astype(np.uint8),
-                               mode='RGB')
-    y, cb, cr = pil_rgb.convert('YCbCr').split()
-
-    y_arr = np.asarray(y, dtype=np.float64) / 255.0
-
-    resultado = upscale_poisson_screened(y_arr, factor=factor, lam=lam,
-                                          beta=beta, tau=tau, **kwargs)
-    y_up = resultado['imagen_recon']
-    new_h, new_w = y_up.shape
-
-    cb_up = cb.resize((new_w, new_h), Image.BICUBIC)
-    cr_up = cr.resize((new_w, new_h), Image.BICUBIC)
-    y_up_pil = Image.fromarray((np.clip(y_up, 0.0, 1.0) * 255).astype(np.uint8),
-                                mode='L')
-
-    salida = Image.merge('YCbCr', (y_up_pil, cb_up, cr_up)).convert('RGB')
-    return np.asarray(salida, dtype=np.float64) / 255.0
+    res['imagen_recon'] = ycbcr_a_rgb(res['imagen_recon'], cb_up, cr_up)
+    if res['snapshots'] is not None:
+        res['snapshots'] = [ycbcr_a_rgb(s, cb_up, cr_up) for s in res['snapshots']]
+    return res
